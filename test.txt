@@ -1,0 +1,366 @@
+# app/main.py
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+import os
+import shutil
+from datetime import datetime
+from PyPDF2 import PdfReader
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain.docstore.document import Document
+from langchain.llms import HuggingFacePipeline
+from transformers import (
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+    pipeline,
+    GenerationConfig
+)
+import torch
+from tqdm import tqdm
+import logging
+import uuid
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="PDF QA API",
+    description="API for querying PDF documents with natural language",
+    version="1.0.0"
+)
+
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configuration
+class Config:
+    def __init__(self):
+        self.model_name = "google/flan-t5-large"
+        self.embedding_model = "all-MiniLM-L6-v2"
+        self.chunk_size = 1000
+        self.chunk_overlap = 200
+        self.max_new_tokens = 300
+        self.temperature = 0.3
+        self.k_results = 3
+        self.relevance_threshold = 0.7
+        self.upload_folder = "uploads"
+        self.index_folder = "indices"
+
+config = Config()
+
+# Ensure directories exist
+os.makedirs(config.upload_folder, exist_ok=True)
+os.makedirs(config.index_folder, exist_ok=True)
+
+# Models
+class QueryRequest(BaseModel):
+    question: str
+    collection_id: Optional[str] = None
+    include_sources: bool = True
+
+class UploadResponse(BaseModel):
+    collection_id: str
+    file_count: int
+    status: str
+
+class QAResponse(BaseModel):
+    answer: str
+    sources: List[str]
+    collection_id: str
+    processing_time: float
+
+class CollectionInfo(BaseModel):
+    collection_id: str
+    document_count: int
+    created_at: str
+    file_names: List[str]
+
+class PDFQAProcessor:
+    def __init__(self):
+        self.llm = None
+        self.tokenizer = None
+        self.initialize_components()
+    
+    def initialize_components(self):
+        """Initialize ML components"""
+        logger.info("Initializing NLP components...")
+        
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                config.model_name,
+                device_map="auto",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            )
+            
+            generation_config = GenerationConfig(
+                max_new_tokens=config.max_new_tokens,
+                temperature=config.temperature,
+                do_sample=True,
+                top_p=0.95
+            )
+            
+            pipe = pipeline(
+                "text2text-generation",
+                model=model,
+                tokenizer=self.tokenizer,
+                device=0 if torch.cuda.is_available() else -1,
+                generation_config=generation_config
+            )
+            
+            self.llm = HuggingFacePipeline(pipeline=pipe)
+            logger.info("Components initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize components: {str(e)}")
+            raise
+
+processor = PDFQAProcessor()
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize components on startup"""
+    try:
+        processor.initialize_components()
+    except Exception as e:
+        logger.error(f"Startup failed: {str(e)}")
+        raise
+
+def process_pdfs(pdf_files: List[str], collection_id: str) -> int:
+    """Process and index PDF files"""
+    try:
+        documents = []
+        for pdf_file in tqdm(pdf_files, desc="Processing PDFs"):
+            try:
+                pdf_reader = PdfReader(pdf_file)
+                base_name = os.path.basename(pdf_file)
+                
+                for page_num, page in enumerate(pdf_reader.pages, start=1):
+                    text = page.extract_text()
+                    if text:
+                        doc = Document(
+                            page_content=text,
+                            metadata={
+                                "source": base_name,
+                                "page": page_num,
+                                "collection_id": collection_id
+                            }
+                        )
+                        documents.append(doc)
+            except Exception as e:
+                logger.warning(f"Error processing {pdf_file}: {str(e)}")
+                continue
+        
+        if not documents:
+            raise ValueError("No valid text content extracted from PDFs")
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        
+        chunks = text_splitter.split_documents(documents)
+        
+        embeddings = HuggingFaceEmbeddings(
+            model_name=config.embedding_model,
+            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+        )
+        
+        # Create or update FAISS index
+        index_path = os.path.join(config.index_folder, f"{collection_id}.faiss")
+        if os.path.exists(index_path):
+            vector_store = FAISS.load_local(
+                os.path.join(config.index_folder, collection_id),
+                embeddings
+            )
+            vector_store.add_documents(chunks)
+        else:
+            vector_store = FAISS.from_documents(chunks, embeddings)
+        
+        vector_store.save_local(os.path.join(config.index_folder, collection_id))
+        return len(documents)
+    
+    except Exception as e:
+        logger.error(f"PDF processing failed: {str(e)}")
+        raise
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_pdfs(files: List[UploadFile] = File(...)):
+    """Upload and process PDF files"""
+    try:
+        collection_id = str(uuid.uuid4())
+        collection_path = os.path.join(config.upload_folder, collection_id)
+        os.makedirs(collection_path, exist_ok=True)
+        
+        saved_files = []
+        for file in files:
+            if not file.filename.lower().endswith('.pdf'):
+                continue
+            
+            file_path = os.path.join(collection_path, file.filename)
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            saved_files.append(file_path)
+        
+        if not saved_files:
+            raise HTTPException(status_code=400, detail="No valid PDF files uploaded")
+        
+        doc_count = process_pdfs(saved_files, collection_id)
+        
+        return UploadResponse(
+            collection_id=collection_id,
+            file_count=doc_count,
+            status="success"
+        )
+    
+    except Exception as e:
+        logger.error(f"Upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/query", response_model=QAResponse)
+async def query_documents(request: QueryRequest):
+    """Query the document collection"""
+    start_time = datetime.now()
+    try:
+        collection_id = request.collection_id or next(
+            (f.split('.')[0] for f in os.listdir(config.index_folder) 
+            if f.endswith('.faiss')), None
+        )
+        
+        if not collection_id:
+            raise HTTPException(status_code=404, detail="No document collections available")
+        
+        index_path = os.path.join(config.index_folder, collection_id)
+        if not os.path.exists(f"{index_path}.faiss"):
+            raise HTTPException(status_code=404, detail="Collection not found")
+        
+        embeddings = HuggingFaceEmbeddings(
+            model_name=config.embedding_model,
+            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+        )
+        
+        vector_store = FAISS.load_local(index_path, embeddings)
+        retriever = vector_store.as_retriever(
+            search_kwargs={
+                "k": config.k_results,
+                "score_threshold": config.relevance_threshold,
+                "filter": {"collection_id": collection_id}
+            }
+        )
+        
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=processor.llm,
+            chain_type="map_reduce",
+            retriever=retriever,
+            return_source_documents=True
+        )
+        
+        result = qa_chain({"query": request.question})
+        
+        sources = []
+        if request.include_sources and result.get("source_documents"):
+            unique_sources = set()
+            for doc in result["source_documents"]:
+                source_info = f"{doc.metadata['source']} (page {doc.metadata['page']})"
+                unique_sources.add(source_info)
+            sources = list(unique_sources)
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        return QAResponse(
+            answer=result["result"],
+            sources=sources,
+            collection_id=collection_id,
+            processing_time=processing_time
+        )
+    
+    except Exception as e:
+        logger.error(f"Query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/collections", response_model=List[CollectionInfo])
+async def list_collections():
+    """List available document collections"""
+    try:
+        collections = []
+        for f in os.listdir(config.index_folder):
+            if f.endswith('.faiss'):
+                collection_id = f.split('.')[0]
+                created_at = datetime.fromtimestamp(
+                    os.path.getmtime(os.path.join(config.index_folder, f))
+                
+                # Count documents in collection (approximate)
+                vector_store = FAISS.load_local(
+                    os.path.join(config.index_folder, collection_id),
+                    HuggingFaceEmbeddings(model_name=config.embedding_model)
+                )
+                
+                # Get unique source files
+                source_files = set()
+                if hasattr(vector_store, 'docstore'):
+                    for doc_id in vector_store.docstore._dict:
+                        doc = vector_store.docstore._dict[doc_id]
+                        if hasattr(doc, 'metadata') and 'source' in doc.metadata:
+                            source_files.add(doc.metadata['source'])
+                
+                collections.append(CollectionInfo(
+                    collection_id=collection_id,
+                    document_count=len(source_files),
+                    created_at=created_at.isoformat(),
+                    file_names=list(source_files)
+                ))
+        
+        return collections
+    
+    except Exception as e:
+        logger.error(f"Failed to list collections: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/collection/{collection_id}")
+async def delete_collection(collection_id: str):
+    """Delete a document collection"""
+    try:
+        index_files = [
+            os.path.join(config.index_folder, f"{collection_id}.faiss"),
+            os.path.join(config.index_folder, f"{collection_id}.pkl")
+        ]
+        
+        deleted = False
+        for f in index_files:
+            if os.path.exists(f):
+                os.remove(f)
+                deleted = True
+        
+        upload_dir = os.path.join(config.upload_folder, collection_id)
+        if os.path.exists(upload_dir):
+            shutil.rmtree(upload_dir)
+            deleted = True
+        
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Collection not found")
+        
+        return {"status": "success", "message": "Collection deleted"}
+    
+    except Exception as e:
+        logger.error(f"Failed to delete collection: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

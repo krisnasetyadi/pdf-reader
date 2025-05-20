@@ -1,0 +1,187 @@
+from fastapi import APIRouter, HTTPException
+from models import QueryRequest, QAResponse
+from config import config
+from processor import processor
+from langchain.embeddings.huggingface import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain.schema import Document
+import torch
+from datetime import datetime
+import os
+import logging
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def truncate_document_content(docs, max_chars=800):
+    """Truncate document content to avoid token limit issues"""
+    truncated_docs = []
+    for doc in docs:
+        truncated_content = doc.page_content[:max_chars] + ("..." if len(doc.page_content) > max_chars else "")
+        truncated_docs.append(Document(
+            page_content=truncated_content,
+            metadata=doc.metadata
+        ))
+    return truncated_docs
+
+@router.post("/query", response_model=QAResponse)
+async def query_documents(request: QueryRequest):
+    start_time = datetime.now()
+    try:
+        collection_id = request.collection_id or next(
+            (f.split('.')[0] for f in os.listdir(config.index_folder) 
+            if f.endswith('.faiss')), None
+        )
+        
+        if not collection_id:
+            raise HTTPException(status_code=404, detail="No document collections available")
+        
+        index_path = os.path.join(config.index_folder, collection_id)
+        if not os.path.exists(f"{index_path}/index.faiss"):
+            raise HTTPException(status_code=404, detail="Collection not found")
+        
+        embeddings = HuggingFaceEmbeddings(
+            model_name=config.embedding_model,
+            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+        )
+        
+        vector_store = FAISS.load_local(
+            index_path,
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+        
+        # Get raw documents from vector store
+        raw_docs = vector_store.similarity_search(
+            request.question,
+            k=2,
+            filter={"collection_id": collection_id} if hasattr(vector_store, "filter") else None
+        )
+        
+        # Truncate document content
+        truncated_docs = truncate_document_content(raw_docs)
+        
+        # Create a FAISS vector store with the truncated documents
+        temp_vector_store = FAISS.from_documents(truncated_docs, embeddings)
+        
+        # Use the vector store's retriever
+        retriever = temp_vector_store.as_retriever(search_kwargs={"k": 2})
+        
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=processor.llm,
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=True
+        )
+        
+        result = qa_chain({"query": request.question})
+        
+        sources = []
+        if request.include_sources and result.get("source_documents"):
+            unique_sources = set()
+            for doc in result["source_documents"]:
+                source_info = f"{doc.metadata['source']} (page {doc.metadata['page']})"
+                unique_sources.add(source_info)
+            sources = list(unique_sources)
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        return QAResponse(
+            answer=result["result"],
+            sources=sources,
+            collection_id=collection_id,
+            processing_time=processing_time
+        )
+    
+    except Exception as e:
+        logger.error(f"Query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    """Query the document collection"""
+    start_time = datetime.now()
+    try:
+        collection_id = request.collection_id or next(
+            (f.split('.')[0] for f in os.listdir(config.index_folder) 
+            if f.endswith('.faiss')), None
+        )
+        
+        if not collection_id:
+            raise HTTPException(status_code=404, detail="No document collections available")
+        
+        index_path = os.path.join(config.index_folder, collection_id)
+        print(f"Index path: {index_path}, Collection ID: {collection_id}")
+        if not os.path.exists(f"{index_path}/index.faiss"):
+            raise HTTPException(status_code=404, detail="Collection not found")
+        
+        embeddings = HuggingFaceEmbeddings(
+            model_name=config.embedding_model,
+            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
+        )
+        
+        vector_store = FAISS.load_local(
+            index_path,
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+        
+        # Get raw documents from vector store
+        raw_docs = vector_store.similarity_search(
+            request.question,
+            k=2,  # Use a small k to limit number of results
+            filter={"collection_id": collection_id} if hasattr(vector_store, "filter") else None
+        )
+        
+        # Truncate document content to avoid token limit errors
+        truncated_docs = truncate_document_content(raw_docs)
+        
+        # Create a custom retriever that returns our truncated documents
+        from langchain.schema import BaseRetriever
+        from typing import List
+        
+        class StaticRetriever(BaseRetriever):
+            docs: List[Document]
+            
+            def __init__(self, docs):
+                self.docs = docs
+                super().__init__()
+            
+            def get_relevant_documents(self, query):
+                return self.docs
+                
+            async def aget_relevant_documents(self, query):
+                return self.docs
+        
+        custom_retriever = StaticRetriever(truncated_docs)
+        
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=processor.llm,
+            chain_type="stuff",  # Use "stuff" instead of "map_reduce" for shorter inputs
+            retriever=custom_retriever,
+            return_source_documents=True
+        )
+        
+        result = qa_chain({"query": request.question})
+        
+        print('result_nya_kak', result)
+        sources = []
+        if request.include_sources and result.get("source_documents"):
+            unique_sources = set()
+            for doc in result["source_documents"]:
+                source_info = f"{doc.metadata['source']} (page {doc.metadata['page']})"
+                print('source_info', source_info)
+                unique_sources.add(source_info)
+            sources = list(unique_sources)
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        return QAResponse(
+            answer=result["result"],
+            sources=sources,
+            collection_id=collection_id,
+            processing_time=processing_time
+        )
+    
+    except Exception as e:
+        logger.error(f"Query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
