@@ -1,0 +1,60 @@
+# app/upload_pdf.py
+import os
+import psycopg2
+from fastapi import APIRouter, UploadFile, HTTPException
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from PyPDF2 import PdfReader
+
+router = APIRouter()
+
+# --- Koneksi PostgreSQL ---
+DB_CONN = psycopg2.connect(
+    dbname="ragdb",
+    user="youruser",
+    password="yourpassword",
+    host="localhost",
+    port="5432"
+)
+DB_CONN.autocommit = True
+
+# Pastikan tabel ada
+with DB_CONN.cursor() as cur:
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id SERIAL PRIMARY KEY,
+            filename TEXT,
+            chunk_id INT,
+            content TEXT,
+            embedding VECTOR(768)
+        );
+    """)
+
+# --- Embedding Model ---
+embeddings_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+@router.post("/upload-pdf")
+async def upload_pdf(file: UploadFile):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+
+    # 1. Baca PDF
+    pdf_reader = PdfReader(file.file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text() + "\n"
+
+    # 2. Chunking
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    chunks = text_splitter.split_text(text)
+
+    # 3. Embedding + Simpan
+    with DB_CONN.cursor() as cur:
+        for idx, chunk in enumerate(chunks):
+            vector = embeddings_model.embed_query(chunk)
+            cur.execute(
+                "INSERT INTO documents (filename, chunk_id, content, embedding) VALUES (%s, %s, %s, %s)",
+                (file.filename, idx, chunk, vector)
+            )
+
+    return {"status": "success", "chunks_saved": len(chunks)}

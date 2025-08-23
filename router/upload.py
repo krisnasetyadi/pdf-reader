@@ -1,5 +1,7 @@
+# upload.py
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from typing import List
+import psycopg2
 import os
 import shutil
 import uuid
@@ -10,6 +12,26 @@ import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+DB_CONN = psycopg2.connect(
+    dbname="LLM",
+    user="postgres",
+    password="qwerty123",
+    host="localhost",
+    port="5432"
+)
+
+DB_CONN.autocommit = True
+
+with DB_CONN.cursor() as cur:
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id SERIAL PRIMARY KEY,
+            collection_id UUID NOT NULL,
+            file_path TEXT NOT NULL,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 
 @router.post("/upload", response_model=UploadResponse)

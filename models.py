@@ -1,10 +1,11 @@
+# models.py
 from pydantic import BaseModel
 from typing import List, Optional
 
 
 class QueryRequest(BaseModel):
     question: str
-    collection_id: Optional[str] = None
+    collection_id: Optional[str] = None  # Now optional
     include_sources: bool = True
 
 
@@ -16,8 +17,8 @@ class UploadResponse(BaseModel):
 
 class QAResponse(BaseModel):
     answer: str
-    sources: List[str]
-    collection_id: str
+    sources: List[str]  # Now includes collection IDs
+    collection_id: str   # "all_collections" when searching globally
     processing_time: float
 
 

@@ -8,11 +8,14 @@ from processor import processor
 from router.upload import router as upload_router
 from router.query import router as query_router
 from router.collections import router as collections_router
+from qa_dataset_generator import build_qa_dataset
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -37,6 +40,7 @@ os.makedirs(config.index_folder, exist_ok=True)
 async def startup_event():
     try:
         processor.initialize_components()
+        logger.info("Application startup completed")
     except Exception as e:
         logger.error(f"Startup failed: {str(e)}")
         raise
@@ -44,7 +48,6 @@ async def startup_event():
 app.include_router(upload_router)
 app.include_router(query_router)
 app.include_router(collections_router)
-
 
 if __name__ == "__main__":
     import uvicorn
