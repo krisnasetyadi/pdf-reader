@@ -1,3 +1,4 @@
+# processor.py
 from config import config
 from transformers import (
     AutoModelForSeq2SeqLM,
@@ -10,10 +11,11 @@ from langchain_community.llms import HuggingFacePipeline
 from langchain_community.embeddings.huggingface import HuggingFaceEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
+# from langchain.schema import Document
 import threading
 import torch
 import os
-import re
+# import time
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,19 @@ class PDFQAProcessor:
             "proses": ["tahapan", "langkah", "mekanisme", "cara kerja"],
             "auction": ["lelang", "penawaran", "bidding", "tender"]
         }
+
+        self.qa_prompt = PromptTemplate(
+            input_variables=["context", "question"],
+            template="""Gunakan informasi dari dokumen berikut untuk menjawab pertanyaan secara akurat dan lengkap.
+        Jika jawaban tidak ditemukan dalam dokumen, katakan secara jujur bahwa Anda tidak tahu.
+
+        Konteks dokumen:
+        {context}
+
+        Pertanyaan: {question}
+
+        Jawaban yang akurat berdasarkan dokumen:"""
+        )
 
     def expand_query(self, query):
         """Expand query with synonyms and related terms"""
@@ -70,45 +85,23 @@ class PDFQAProcessor:
                     encode_kwargs={'normalize_embeddings': True}
                 )
 
-                # Initialize LLM components dengan fallback
-                try:
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        config.model_name)
-                except Exception as e:
-                    logger.warning(f"Primary model {config.model_name} failed, using fallback: google/flan-t5-small")
-                    config.model_name = "google/flan-t5-small"  # Fallback ke model yang lebih kecil
-                    self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-
-                # Add padding token if it doesn't exist
-                if self.tokenizer.pad_token is None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-
-                try:
-                    model = AutoModelForSeq2SeqLM.from_pretrained(
-                        config.model_name,
-                        device_map="auto",
-                        torch_dtype=torch.float16 if torch.cuda.is_available()
-                        else torch.float32,
-                        low_cpu_mem_usage=True
-                    )
-                except Exception as e:
-                    logger.warning(f"Primary model {config.model_name} failed, using fallback: google/flan-t5-small")
-                    config.model_name = "google/flan-t5-small"
-                    model = AutoModelForSeq2SeqLM.from_pretrained(
-                        config.model_name,
-                        device_map="auto",
-                        torch_dtype=torch.float16 if torch.cuda.is_available()
-                        else torch.float32,
-                        low_cpu_mem_usage=True
-                    )
+                # Initialize LLM components
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    config.model_name)
+                model = AutoModelForSeq2SeqLM.from_pretrained(
+                    config.model_name,
+                    device_map="auto",
+                    torch_dtype=torch.float16 if torch.cuda.is_available()
+                    else torch.float32,
+                    low_cpu_mem_usage=True
+                )
 
                 generation_config = GenerationConfig(
                     max_new_tokens=config.max_new_tokens,
                     temperature=config.temperature,
                     do_sample=True,
                     top_p=0.9,
-                    repetition_penalty=1.1,
-                    pad_token_id=self.tokenizer.pad_token_id
+                    repetition_penalty=1.1
                 )
 
                 pipe = pipeline(
@@ -121,69 +114,11 @@ class PDFQAProcessor:
 
                 self.llm = HuggingFacePipeline(pipeline=pipe)
                 self._initialized = True
-                logger.info(f"Components initialized successfully with model: {config.model_name}")
+                logger.info("Components initialized successfully")
 
             except Exception as e:
                 logger.error(f"Failed to initialize components: {str(e)}")
                 raise
-    # def initialize_components(self):
-    #     """Initialize ML components with thread safety"""
-    #     with self._init_lock:
-    #         if self._initialized:
-    #             return
-
-    #         logger.info("Initializing NLP components...")
-    #         try:
-    #             # Initialize embeddings first (faster to load)
-    #             self.embeddings = HuggingFaceEmbeddings(
-    #                 model_name=config.embedding_model,
-    #                 model_kwargs={
-    #                     'device': 'cuda' if torch.cuda.is_available()
-    #                     else 'cpu'
-    #                 },
-    #                 encode_kwargs={'normalize_embeddings': True}
-    #             )
-
-    #             # Initialize LLM components
-    #             self.tokenizer = AutoTokenizer.from_pretrained(
-    #                 config.model_name)
-
-    #             # Add padding token if it doesn't exist
-    #             if self.tokenizer.pad_token is None:
-    #                 self.tokenizer.pad_token = self.tokenizer.eos_token
-
-    #             model = AutoModelForSeq2SeqLM.from_pretrained(
-    #                 config.model_name,
-    #                 device_map="auto",
-    #                 torch_dtype=torch.float16 if torch.cuda.is_available()
-    #                 else torch.float32,
-    #                 low_cpu_mem_usage=True
-    #             )
-
-    #             generation_config = GenerationConfig(
-    #                 max_new_tokens=config.max_new_tokens,
-    #                 temperature=config.temperature,
-    #                 do_sample=True,
-    #                 top_p=0.9,
-    #                 repetition_penalty=1.1,
-    #                 pad_token_id=self.tokenizer.pad_token_id
-    #             )
-
-    #             pipe = pipeline(
-    #                 "text2text-generation",
-    #                 model=model,
-    #                 tokenizer=self.tokenizer,
-    #                 generation_config=generation_config,
-    #                 batch_size=4 if torch.cuda.is_available() else 1
-    #             )
-
-    #             self.llm = HuggingFacePipeline(pipeline=pipe)
-    #             self._initialized = True
-    #             logger.info("Components initialized successfully")
-
-    #         except Exception as e:
-    #             logger.error(f"Failed to initialize components: {str(e)}")
-    #             raise
 
     def get_vector_store(self, collection_id):
         """Get vector store from cache or load from disk with thread safety"""
@@ -213,7 +148,8 @@ class PDFQAProcessor:
 
             except Exception as e:
                 logger.error(
-                    f"Failed to load vector store for {collection_id}: {str(e)}"
+                    f"Failed to load vector store for {collection_id}: {str(e)
+                                                                        }"
                 )
                 return None
 
@@ -268,16 +204,6 @@ class PDFQAProcessor:
         sorted_results = sorted(unique_results.values(), key=lambda x: x[1], reverse=True)
         return [doc for doc, score in sorted_results[:config.total_k_results]]
 
-    def truncate_context(self, text, max_tokens=500):
-        """Truncate context to avoid token limit issues"""
-        # Simple word-based truncation
-        words = text.split()
-        if len(words) > max_tokens:
-            truncated = " ".join(words[:max_tokens]) + "... [truncated]"
-            logger.warning(f"Context truncated from {len(words)} to {max_tokens} words")
-            return truncated
-        return text
-
     def generate_answer(self, context_docs, question):
         """Generate answer with enhanced context handling"""
         if not context_docs:
@@ -290,34 +216,34 @@ class PDFQAProcessor:
             page = doc.metadata.get('page', 'Unknown')
             score = doc.metadata.get('similarity_score', 0)
 
-            # Truncate each document content to avoid token limit
-            truncated_content = self.truncate_context(doc.page_content, max_tokens=200)
-
             context_parts.append(
                 f"[Source: {source}, Page: {page}, Confidence: {score:.2f}]\n"
-                f"{truncated_content}\n"
+                f"{doc.page_content}\n"
             )
 
         context = "\n".join(context_parts)
 
-        # Further truncate the entire context if needed
-        context = self.truncate_context(context, max_tokens=500)
+        # Enhanced prompt template
+        prompt_template = """Berdasarkan informasi dari dokumen-dokumen berikut, jawab pertanyaan dengan lengkap dan akurat.
 
-        # Simplified prompt template to avoid instruction confusion
-        prompt_template = """Berdasarkan informasi dari dokumen berikut, jawab pertanyaan dengan jelas dan akurat.
+    INFORMASI DOKUMEN:
+    {context}
 
-INFORMASI DOKUMEN:
-{context}
+    PERTANYAAN: {question}
 
-PERTANYAAN: {question}
+    INSTRUKSI:
+    1. Jawab hanya berdasarkan informasi yang tersedia dalam dokumen
+    2. Jika informasi tidak lengkap, jelaskan sejauh yang diketahui dari dokumen
+    3. Jika tidak ada informasi yang relevan, katakan "Informasi tidak tersedia dalam dokumen"
+    4. Gunakan bahasa Indonesia yang formal dan jelas
+    5. Sertakan detail penting dari dokumen
 
-JAWABAN:"""
+    JAWABAN:"""
 
         prompt = prompt_template.format(context=context, question=question)
 
         try:
-            # Use invoke() instead of __call__() to avoid deprecation warning
-            result = self.llm.invoke(prompt)
+            result = self.llm(prompt)
             return result.strip()
         except Exception as e:
             logger.error(f"LLM generation failed: {str(e)}")

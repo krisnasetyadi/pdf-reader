@@ -1,187 +1,126 @@
 from fastapi import APIRouter, HTTPException
-from models import QueryRequest, QAResponse
-from config import config
-from processor import processor
-from langchain.embeddings.huggingface import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain.schema import Document
-import torch
-from datetime import datetime
-import os
 import logging
+import asyncio
+from datetime import datetime
+
+from processor import processor
+from config import config
+from models import QueryRequest, QAResponse
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def truncate_document_content(docs, max_chars=800):
-    """Truncate document content to avoid token limit issues"""
-    truncated_docs = []
-    for doc in docs:
-        truncated_content = doc.page_content[:max_chars] + ("..." if len(doc.page_content) > max_chars else "")
-        truncated_docs.append(Document(
-            page_content=truncated_content,
-            metadata=doc.metadata
-        ))
-    return truncated_docs
-
 @router.post("/query", response_model=QAResponse)
 async def query_documents(request: QueryRequest):
+    """Enhanced query with better error handling"""
     start_time = datetime.now()
+
     try:
-        collection_id = request.collection_id or next(
-            (f.split('.')[0] for f in os.listdir(config.index_folder) 
-            if f.endswith('.faiss')), None
-        )
-        
-        if not collection_id:
-            raise HTTPException(status_code=404, detail="No document collections available")
-        
-        index_path = os.path.join(config.index_folder, collection_id)
-        if not os.path.exists(f"{index_path}/index.faiss"):
-            raise HTTPException(status_code=404, detail="Collection not found")
-        
-        embeddings = HuggingFaceEmbeddings(
-            model_name=config.embedding_model,
-            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
-        )
-        
-        vector_store = FAISS.load_local(
-            index_path,
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
-        
-        # Get raw documents from vector store
-        raw_docs = vector_store.similarity_search(
+        # Validate question
+        if not request.question.strip() or len(request.question.strip()) < 3:
+            raise HTTPException(
+                status_code=400,
+                detail="Pertanyaan terlalu pendek atau kosong"
+            )
+
+        # Determine which collections to search
+        if request.collection_id:
+            if request.collection_id not in processor.get_all_collections():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Collection {request.collection_id} tidak ditemukan"
+                )
+            collection_ids = [request.collection_id]
+        else:
+            collection_ids = processor.get_all_collections()
+
+        if not collection_ids:
+            raise HTTPException(
+                status_code=404,
+                detail="Tidak ada koleksi dokumen yang tersedia"
+            )
+
+        # Search across collections
+        relevant_docs = processor.search_across_collections(
             request.question,
-            k=2,
-            filter={"collection_id": collection_id} if hasattr(vector_store, "filter") else None
+            collection_ids,
+            top_k=config.k_per_collection
         )
-        
-        # Truncate document content
-        truncated_docs = truncate_document_content(raw_docs)
-        
-        # Create a FAISS vector store with the truncated documents
-        temp_vector_store = FAISS.from_documents(truncated_docs, embeddings)
-        
-        # Use the vector store's retriever
-        retriever = temp_vector_store.as_retriever(search_kwargs={"k": 2})
-        
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=processor.llm,
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=True
+
+        if not relevant_docs:
+            raise HTTPException(
+                status_code=404,
+                detail="Tidak ditemukan informasi relevan dalam dokumen"
+            )
+
+        # Generate answer
+        answer = await asyncio.to_thread(
+            processor.generate_answer, relevant_docs, request.question
         )
-        
-        result = qa_chain({"query": request.question})
-        
+
+        # Prepare sources with better formatting
         sources = []
-        if request.include_sources and result.get("source_documents"):
-            unique_sources = set()
-            for doc in result["source_documents"]:
-                source_info = f"{doc.metadata['source']} (page {doc.metadata['page']})"
-                unique_sources.add(source_info)
-            sources = list(unique_sources)
-        
+        for doc in relevant_docs:
+            source_info = f"{doc.metadata.get('source', 'Unknown')}"
+            if 'page' in doc.metadata:
+                source_info += f" (Halaman {doc.metadata['page']})"
+            sources.append(source_info)
+
         processing_time = (datetime.now() - start_time).total_seconds()
-        
+
         return QAResponse(
-            answer=result["result"],
+            answer=answer,
             sources=sources,
-            collection_id=collection_id,
+            collection_id=request.collection_id or "all_collections",
             processing_time=processing_time
         )
-    
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Query failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    """Query the document collection"""
-    start_time = datetime.now()
+        raise HTTPException(
+            status_code=500,
+            detail="Terjadi kesalahan internal dalam pemrosesan query"
+        )
+
+
+@router.post("/query/debug")
+async def query_debug(request: QueryRequest):
+    """Debug endpoint to see search results"""
     try:
-        collection_id = request.collection_id or next(
-            (f.split('.')[0] for f in os.listdir(config.index_folder) 
-            if f.endswith('.faiss')), None
+        if not request.question.strip():
+            raise HTTPException(status_code=400, detail="Pertanyaan kosong")
+
+        collection_ids = [request.collection_id] if request.collection_id else processor.get_all_collections()
+
+        if not collection_ids:
+            return {"error": "No collections available", "results": []}
+
+        # Get search results
+        relevant_docs = processor.search_across_collections(
+            request.question, collection_ids, top_k=config.k_per_collection
         )
-        
-        if not collection_id:
-            raise HTTPException(status_code=404, detail="No document collections available")
-        
-        index_path = os.path.join(config.index_folder, collection_id)
-        print(f"Index path: {index_path}, Collection ID: {collection_id}")
-        if not os.path.exists(f"{index_path}/index.faiss"):
-            raise HTTPException(status_code=404, detail="Collection not found")
-        
-        embeddings = HuggingFaceEmbeddings(
-            model_name=config.embedding_model,
-            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
-        )
-        
-        vector_store = FAISS.load_local(
-            index_path,
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
-        
-        # Get raw documents from vector store
-        raw_docs = vector_store.similarity_search(
-            request.question,
-            k=2,  # Use a small k to limit number of results
-            filter={"collection_id": collection_id} if hasattr(vector_store, "filter") else None
-        )
-        
-        # Truncate document content to avoid token limit errors
-        truncated_docs = truncate_document_content(raw_docs)
-        
-        # Create a custom retriever that returns our truncated documents
-        from langchain.schema import BaseRetriever
-        from typing import List
-        
-        class StaticRetriever(BaseRetriever):
-            docs: List[Document]
-            
-            def __init__(self, docs):
-                self.docs = docs
-                super().__init__()
-            
-            def get_relevant_documents(self, query):
-                return self.docs
-                
-            async def aget_relevant_documents(self, query):
-                return self.docs
-        
-        custom_retriever = StaticRetriever(truncated_docs)
-        
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=processor.llm,
-            chain_type="stuff",  # Use "stuff" instead of "map_reduce" for shorter inputs
-            retriever=custom_retriever,
-            return_source_documents=True
-        )
-        
-        result = qa_chain({"query": request.question})
-        
-        print('result_nya_kak', result)
-        sources = []
-        if request.include_sources and result.get("source_documents"):
-            unique_sources = set()
-            for doc in result["source_documents"]:
-                source_info = f"{doc.metadata['source']} (page {doc.metadata['page']})"
-                print('source_info', source_info)
-                unique_sources.add(source_info)
-            sources = list(unique_sources)
-        
-        processing_time = (datetime.now() - start_time).total_seconds()
-        
-        return QAResponse(
-            answer=result["result"],
-            sources=sources,
-            collection_id=collection_id,
-            processing_time=processing_time
-        )
-    
+
+        # Format debug information
+        debug_results = []
+        for i, doc in enumerate(relevant_docs):
+            debug_results.append({
+                "rank": i + 1,
+                "score": doc.metadata.get("similarity_score", 0),
+                "source": doc.metadata.get("source", "Unknown"),
+                "page": doc.metadata.get("page", "Unknown"),
+                "collection": doc.metadata.get("collection_id", "Unknown"),
+                "content_preview": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
+            })
+
+        return {
+            "question": request.question,
+            "total_results": len(relevant_docs),
+            "results": debug_results
+        }
+
     except Exception as e:
-        logger.error(f"Query failed: {str(e)}")
+        logger.error(f"Debug query failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

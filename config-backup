@@ -1,0 +1,28 @@
+from pydantic_settings import BaseSettings
+from pydantic import Field
+
+
+class Config(BaseSettings):
+    # Model Configuration - Updated for better QA performance
+    model_name: str = Field(default="google/flan-t5-large")
+    embedding_model: str = Field(
+        default="sentence-transformers/all-mpnet-base-v2")  # Better embedding model
+    max_new_tokens: int = Field(default=512)
+    temperature: float = Field(default=0.3)
+
+    # File Paths
+    upload_folder: str = Field(default="data/uploads")
+    index_folder: str = Field(default="data/indices")
+
+    # Retrieval Parameters - Optimized
+    chunk_size: int = Field(default=800)  # Reduced for better context
+    chunk_overlap: int = Field(default=150)
+    k_results: int = Field(default=5)
+    k_per_collection: int = Field(default=3)
+    total_k_results: int = Field(default=10)  # Reduced for efficiency
+
+    class Config:
+        env_file = ".env"
+
+
+config = Config()
