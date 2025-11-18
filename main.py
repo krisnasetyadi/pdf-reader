@@ -5,7 +5,7 @@ import os
 import logging
 from config import config
 from processor import processor
-# import asyncio
+from database_sqlite import create_tables, test_connection
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,9 +15,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="PDF QA API",
-    description="API for querying PDF documents with natural language",
-    version="1.0.0"
+    title="Hybrid PDF QA API",
+    description="API for querying both structured and unstructured data with natural language",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -36,6 +36,16 @@ os.makedirs(config.index_folder, exist_ok=True)
 @app.on_event("startup")
 async def startup_event():
     try:
+        # Initialize database
+        logger.info("Testing database connection...")
+        if test_connection():
+            logger.info("Database connection successful")
+            create_tables()
+            logger.info("Database tables created/verified")
+        else:
+            logger.warning("Database connection failed - hybrid features may not work")
+
+        # Initialize ML processor
         processor.initialize_components()
         logger.info("Application startup completed")
     except Exception as e:
@@ -58,10 +68,12 @@ try:
     from router.upload import router as upload_router
     from router.query import router as query_router
     from router.collections import router as collections_router
+    from router.hybrid_query import router as hybrid_router
 
     app.include_router(upload_router, prefix="/api/v1")
     app.include_router(query_router, prefix="/api/v1")
     app.include_router(collections_router, prefix="/api/v1")
+    app.include_router(hybrid_router, prefix="/api/v2", tags=["hybrid"])  # New hybrid endpoints
 except ImportError as e:
     logger.warning(
         f"Router import failed: {e}. Some endpoints may not be available.")
@@ -69,7 +81,19 @@ except ImportError as e:
 
 @app.get("/")
 async def root():
-    return {"message": "PDF QA API is running", "version": "1.0.0"}
+    return {
+        "message": "Hybrid PDF QA API is running",
+        "version": "2.0.0",
+        "features": {
+            "structured_data": "PostgreSQL",
+            "unstructured_data": "PDF + Chat logs",
+            "hybrid_search": "Combined querying"
+        },
+        "endpoints": {
+            "v1": "/api/v1 (original endpoints)",
+            "v2": "/api/v2 (hybrid endpoints)"
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
