@@ -17,14 +17,14 @@ async def query_documents(request: QueryRequest):
     start_time = datetime.now()
 
     try:
-        # Validate question
+        #  validate the question
         if not request.question.strip() or len(request.question.strip()) < 3:
             raise HTTPException(
                 status_code=400,
                 detail="Pertanyaan terlalu pendek atau kosong"
             )
 
-        # Determine which collections to search
+        # determine which collections to search
         if request.collection_id:
             if request.collection_id not in processor.get_all_collections():
                 raise HTTPException(
@@ -41,7 +41,7 @@ async def query_documents(request: QueryRequest):
                 detail="Tidak ada koleksi dokumen yang tersedia"
             )
 
-        # Search across collections
+        # do search across collections
         relevant_docs = processor.search_across_collections(
             request.question,
             collection_ids,
@@ -54,12 +54,12 @@ async def query_documents(request: QueryRequest):
                 detail="Tidak ditemukan informasi relevan dalam dokumen"
             )
 
-        # Generate answer
+        # generate the answer
         answer = await asyncio.to_thread(
             processor.generate_answer, relevant_docs, request.question
         )
 
-        # Prepare sources with better formatting
+        # preparing sources with better formatting
         sources = []
         for doc in relevant_docs:
             source_info = f"{doc.metadata.get('source', 'Unknown')}"

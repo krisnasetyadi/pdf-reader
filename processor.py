@@ -8,12 +8,10 @@ from transformers import (
 import logging
 from langchain_community.llms import HuggingFacePipeline
 from langchain_community.embeddings.huggingface import HuggingFaceEmbeddings
-from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
 import threading
 import torch
 import os
-import re
 
 logger = logging.getLogger(__name__)
 
