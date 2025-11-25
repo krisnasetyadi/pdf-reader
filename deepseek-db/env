@@ -1,0 +1,7 @@
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=qa_system
+DB_USER=postgres
+DB_PASSWORD=password
+
+pip install psycopg2-binary sqlalchemy

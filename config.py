@@ -1,7 +1,10 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field
+import os
+from dataclasses import dataclass
 
 
+@dataclass
 class Config(BaseSettings):
     # Gunakan model yang tersedia dan bekerja dengan baik
     model_name: str = Field(default="google/flan-t5-base")
