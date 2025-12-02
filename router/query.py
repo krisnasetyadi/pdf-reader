@@ -1,3 +1,4 @@
+from urllib import request
 from fastapi import APIRouter, HTTPException
 import logging
 import asyncio
@@ -5,7 +6,7 @@ from datetime import datetime
 
 from processor import processor
 from config import config
-from models import QueryRequest, QAResponse
+from models import QueryRequest, QAResponse, SearchType
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -24,57 +25,65 @@ async def query_documents(request: QueryRequest):
                 detail="Pertanyaan terlalu pendek atau kosong"
             )
 
+        if not hasattr(request, 'search_type') or request.search_type == SearchType.UNSTRUCTURED:
+
         # determine which collections to search
-        if request.collection_id:
-            if request.collection_id not in processor.get_all_collections():
+        # if request.collection_id:
+        #     if request.collection_id not in processor.get_all_collections():
+        #         raise HTTPException(
+        #             status_code=404,
+        #             detail=f"Collection {request.collection_id} tidak ditemukan"
+        #         )
+        #     collection_ids = [request.collection_id]
+        # else:
+        #     collection_ids = processor.get_all_collections()
+
+            collection_ids = ([request.collection_id] if request.collection_id 
+                                else processor.get_all_collections())
+            if not collection_ids:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"Collection {request.collection_id} tidak ditemukan"
+                    detail="Tidak ada koleksi dokumen yang tersedia"
                 )
-            collection_ids = [request.collection_id]
+
+            # do search across collections
+            relevant_docs = processor.search_across_collections(
+                request.question,
+                collection_ids,
+                top_k=config.k_per_collection
+            )
+
+            if not relevant_docs:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Tidak ditemukan informasi relevan dalam dokumen"
+                )
+
+            # generate the answer
+            answer = await asyncio.to_thread(
+                processor.generate_answer, relevant_docs, request.question
+            )
+
+            # preparing sources with better formatting
+            sources = []
+            for doc in relevant_docs:
+                source_info = f"{doc.metadata.get('source', 'Unknown')}"
+                if 'page' in doc.metadata:
+                    source_info += f" (Halaman {doc.metadata['page']})"
+                sources.append(source_info)
+
+            processing_time = (datetime.now() - start_time).total_seconds()
+
+            return QAResponse(
+                answer=answer,
+                sources=sources,
+                collection_id=request.collection_id or "all_collections",
+                processing_time=processing_time
+            )
         else:
-            collection_ids = processor.get_all_collections()
-
-        if not collection_ids:
             raise HTTPException(
-                status_code=404,
-                detail="Tidak ada koleksi dokumen yang tersedia"
-            )
-
-        # do search across collections
-        relevant_docs = processor.search_across_collections(
-            request.question,
-            collection_ids,
-            top_k=config.k_per_collection
-        )
-
-        if not relevant_docs:
-            raise HTTPException(
-                status_code=404,
-                detail="Tidak ditemukan informasi relevan dalam dokumen"
-            )
-
-        # generate the answer
-        answer = await asyncio.to_thread(
-            processor.generate_answer, relevant_docs, request.question
-        )
-
-        # preparing sources with better formatting
-        sources = []
-        for doc in relevant_docs:
-            source_info = f"{doc.metadata.get('source', 'Unknown')}"
-            if 'page' in doc.metadata:
-                source_info += f" (Halaman {doc.metadata['page']})"
-            sources.append(source_info)
-
-        processing_time = (datetime.now() - start_time).total_seconds()
-
-        return QAResponse(
-            answer=answer,
-            sources=sources,
-            collection_id=request.collection_id or "all_collections",
-            processing_time=processing_time
-        )
+                status_code=400,
+                detail="Gunakan endpoint /query/hybrid untuk structured atau hybrid search"      )
 
     except HTTPException:
         raise
