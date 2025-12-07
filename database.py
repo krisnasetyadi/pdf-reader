@@ -128,7 +128,7 @@ class DatabaseManager:
             logger.error(f"Failed to get schema for table {table_name}: {e}")
             return []
 
-    def execute_query(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
+    def execute_query(self, query: str, params: Optional[tuple[Any, ...]] = None) -> List[Dict[str, Any]]:
         """Execute a SQL query and return results"""
         try:
             with self.connection.cursor() as cursor:
@@ -215,7 +215,7 @@ class DatabaseManager:
             
             where_clause = " OR ".join(conditions)
             query = f"SELECT * FROM {table_name} WHERE {where_clause} LIMIT %s"
-            params.append(limit)
+            params.append(str(limit))
             
             return self.execute_query(query, tuple(params))
             
@@ -238,4 +238,18 @@ class DatabaseManager:
             self.connection.close()
             logger.info("Database connection closed")
 
+    def get_all_tables(self) -> List[str]:
+        """Get list of all tables in the database"""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT table_name 
+                    FROM information_schema.tables 
+                    WHERE table_schema = 'public';
+                """)
+                tables = cursor.fetchall()
+                return [table['table_name'] for table in tables]
+        except Exception as e:
+            logger.error(f"Failed to get tables: {e}")
+            return []
 db_manager = DatabaseManager()

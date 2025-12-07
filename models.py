@@ -13,6 +13,9 @@ class QueryIntent(str, Enum):
     SEARCH = "search"
     LIST = "list"
     AGGREGATE = "aggregate"
+    SHOW_TABLES = "show_tables" 
+    SHOW_SCHEMA = "show_schema"
+    HELP = "help"
     UNKNOWN = "unknown"
 
 class QueryRequest(BaseModel):
