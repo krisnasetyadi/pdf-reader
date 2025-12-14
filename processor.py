@@ -12,7 +12,7 @@ from langchain_community.vectorstores import FAISS
 import threading
 import torch
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from models import SearchType, DatabaseResult, SourceInfo
 from database import db_manager
 
@@ -34,7 +34,15 @@ class PDFQAProcessor:
         self.query_expansion_terms = {
             "apa itu": ["definisi", "pengertian", "arti", "makna", "jelaskan"],
             "proses": ["tahapan", "langkah", "mekanisme", "cara kerja"],
-            "auction": ["lelang", "penawaran", "bidding", "tender"]
+            "auction": ["lelang", "penawaran", "bidding", "tender"],
+            # LPDU document keywords
+            "buyback": ["pembelian kembali", "buyback cash", "buyback debt switch"],
+            "lpdu": ["layanan perdagangan dealer utama", "dealer utama"],
+            "lpksbn": ["lelang pembelian kembali surat berharga negara"],
+            "settlement": ["penyelesaian transaksi", "setelmen"],
+            "staple bonds": ["paket staple", "destination series", "source series"],
+            "quotation": ["kuotasi", "penawaran", "quote"],
+            "allocation": ["alokasi", "pemenang lelang"]
         }
 
         # Add database-related query expansion
@@ -45,6 +53,41 @@ class PDFQAProcessor:
             "price": ["harga", "cost", "biaya", "tarif", "nilai"],
             "quantity": ["jumlah", "kuantitas", "banyak", "stock"]
         }
+        
+        # Document-specific keywords (for PDF search priority)
+        self.pdf_keywords = [
+            'lpdu', 'lpksbn', 'buyback', 'debt switch', 'auction', 'lelang',
+            'sun', 'sbn', 'djppr', 'mofids', 'dealer utama', 'settlement',
+            'quotation', 'kuotasi', 'alokasi', 'staple bonds', 'securities',
+            'fungsional', 'persyaratan', 'kode a', 'lpdu-bcds', 'lpdu-sa', 'lpdu-dssb',
+            'maker checker', 'enrich data', 'plte', 'bank indonesia'
+        ]
+
+        # Smart table routing - map keywords to specific tables
+        # NOTE: Use generic keywords, NOT hardcoded values like names
+        self.table_keywords = {
+            "user_profiles": [
+                'user', 'pengguna', 'karyawan', 'staff', 'employee', 'profil',
+                'nama', 'email', 'department', 'position', 'jabatan', 'pegawai',
+                'siapa', 'orang', 'anggota', 'member', 'kontak', 'telepon', 'phone',
+                'divisi', 'departemen', 'bagian'  # department-related
+            ],
+            "products": [
+                'product', 'produk', 'barang', 'item', 'harga', 'price',
+                'stock', 'stok', 'kategori', 'category', 'jual', 'beli'
+            ],
+            "orders": [
+                'order', 'pesanan', 'pembelian', 'transaksi', 'beli', 'pesan',
+                'status', 'pending', 'completed', 'shipped', 'quantity',
+                'total', 'amount', 'tanggal', 'invoice'
+            ]
+        }
+        
+        # Person name patterns (untuk deteksi nama orang tanpa hardcode)
+        self.person_question_patterns = [
+            'siapa', 'who is', 'nama', 'karyawan bernama', 'user bernama',
+            'cari orang', 'find person', 'profile'
+        ]
 
     def expand_query(self, query):
         """Expand query with synonyms and related terms"""
@@ -287,7 +330,7 @@ JAWABAN:"""
         """Initialize database connection"""
         try:
             self.db_manager = db_manager
-            self.db_initialized = True
+            self._db_initialized = True  # Fixed: use underscore prefix
             print('masuk db')
             logger.info("Database initialized successfully")
         except Exception as e:
@@ -387,7 +430,7 @@ JAWABAN:"""
         return list(set(expanded_queries))
 
     def analyze_question_type(self, question: str) -> Dict[str, Any]:
-        """Analyze question to determine optimal search strategy"""
+        """Analyze question to determine optimal search strategy with smart table routing"""
         question_lower = question.lower()
 
         #Database-related keywords
@@ -395,61 +438,154 @@ JAWABAN:"""
             'user', 'profile', 'customer', 'product', 'order', 'price', 
             'jumlah', 'total', 'data', 'tabel', 'table', 'database', 'sql',
             'nama', 'email', 'alamat', 'tanggal', 'date', 'harga', 'stock',
-            'karyawan', 'transaksi', 'pesanan'
+            'karyawan', 'transaksi', 'pesanan', 'siapa', 'pegawai', 'staff',
+            'anggota', 'member', 'pelanggan', 'department', 'departemen'
         ]
 
-        #PDF/document-related keywords
-        pdf_keywords = [
+        # Use pdf_keywords from instance (includes LPDU document terms)
+        pdf_terms = getattr(self, 'pdf_keywords', [
             'dokumen', 'pdf', 'file', 'laporan', 'report', 'handbook',
             'kebijakan', 'policy', 'prosedur', 'pedoman', 'guideline',
             'kontrak', 'agreement', 'proposal'
-        ]
+        ])
 
         is_db_question = any(keyword in question_lower for keyword in db_keywords)
-        is_pdf_question = any(keyword in question_lower for keyword in pdf_keywords)
+        is_pdf_question = any(keyword in question_lower for keyword in pdf_terms)
+
+        # Smart table routing - determine which tables to search
+        target_tables = self.get_target_tables(question_lower)
+        
+        # Log detection results
+        logger.info(f"📊 Question analysis: is_db={is_db_question}, is_pdf={is_pdf_question}")
 
         # if both or unclear, use hybrid
         if (is_db_question and is_pdf_question) or (not is_db_question and not is_pdf_question):
             recommended_type = SearchType.HYBRID
+            logger.info(f"🔄 Using HYBRID search (both sources)")
         elif is_db_question:
             recommended_type = SearchType.STRUCTURED
+            logger.info(f"🗄️ Using STRUCTURED search (database)")
         else:
             recommended_type = SearchType.UNSTRUCTURED
+            logger.info(f"📄 Using UNSTRUCTURED search (PDF)")
 
         return {
             "recommended_type": recommended_type,
             "is_db_question": is_db_question,
             "is_pdf_question": is_pdf_question,
-            "search_terms":self.extract_search_terms(question)
+            "search_terms": self.extract_search_terms(question),
+            "target_tables": target_tables  # NEW: specific tables to search
         }
 
+    def get_target_tables(self, question_lower: str) -> List[str]:
+        """Determine which database tables to search based on question content"""
+        target_tables = []
+        table_scores = {}
+        
+        # Check for person-related questions (routes to user_profiles)
+        is_person_question = any(pattern in question_lower for pattern in self.person_question_patterns)
+        if is_person_question:
+            table_scores["user_profiles"] = table_scores.get("user_profiles", 0) + 2  # Higher weight
+        
+        # Score based on keywords
+        for table_name, keywords in self.table_keywords.items():
+            score = sum(1 for keyword in keywords if keyword in question_lower)
+            if score > 0:
+                table_scores[table_name] = table_scores.get(table_name, 0) + score
+        
+        if table_scores:
+            # Sort by score and return tables with matches
+            sorted_tables = sorted(table_scores.items(), key=lambda x: x[1], reverse=True)
+            target_tables = [table for table, score in sorted_tables]
+            logger.info(f"Smart routing: targeting tables {target_tables} (scores: {table_scores})")
+        else:
+            # No specific match, search all tables (fallback)
+            target_tables = list(self.table_keywords.keys())
+            logger.info(f"No specific table match, searching all: {target_tables}")
+        
+        return target_tables
+
     def extract_search_terms(self, question: str) -> List[str]:
-        """Extract meaningful search terms from question"""
-        stop_words = {'apa', 'siapa', 'dimana', 'kapan', 'berapa', 'bagaimana', 
-                 'yang', 'dan', 'atau', 'di', 'ke', 'dari', 'dalam', 'pada',
-                 'data', 'user', 'cari', 'tampilkan', 'semua'}
-        words = question.lower().split()
-        meaningful_terms = [word for word in words if word not in stop_words and len(word) > 2]
+        """Extract meaningful search terms from question - NO hardcoded values"""
+        import re
         
-        additional_terms = []
-        if 'ahmad' in question.lower():
-            additional_terms.extend(['ahmad', 'wijaya'])
-        if 'user' in question.lower():
-            additional_terms.extend(['user', 'pengguna', 'karyawan'])
+        # Stop words to filter out (common question words, not search-worthy)
+        stop_words = {
+            'apa', 'siapa', 'dimana', 'kapan', 'berapa', 'bagaimana', 'mengapa',
+            'yang', 'dan', 'atau', 'di', 'ke', 'dari', 'dalam', 'pada', 'untuk',
+            'adalah', 'ini', 'itu', 'dengan', 'seperti', 'jika', 'maka',
+            'cari', 'tampilkan', 'semua', 'lihat', 'tunjukkan', 'show',
+            'find', 'search', 'get', 'the', 'what', 'who', 'where', 'when', 'how',
+            'jumlah', 'total', 'hitung', 'count', 'berapa', 'banyak', 'orang'  # aggregation + generic words
+        }
         
-        all_terms = meaningful_terms + additional_terms
-        unique_terms = list(set(all_terms))
+        # Column/field words that indicate we're looking for a value, not searching
+        field_indicators = {'department', 'departemen', 'divisi', 'bagian', 'posisi', 'jabatan'}
         
-        print(f"🔍 Extracted search terms: {unique_terms}")
+        # Remove punctuation but keep alphanumeric and spaces
+        cleaned = re.sub(r'[^\w\s]', ' ', question)
+        words = cleaned.split()
+        
+        logger.info(f"🔍 Words from query: {words}")
+        
+        meaningful_terms = []
+        
+        for i, word in enumerate(words):
+            word_lower = word.lower().strip()
+            
+            # Skip stop words first
+            if word_lower in stop_words:
+                continue
+            
+            # If previous word was a field indicator, this word is likely a VALUE
+            # Keep original case for proper nouns like "IT", "HR", "Finance"
+            if i > 0 and words[i-1].lower() in field_indicators:
+                # This is likely a value like "IT", "HR", "Finance"
+                logger.info(f"🔍 Found value after field indicator: {word}")
+                meaningful_terms.append(word.strip())  # Keep original case
+                continue
+            
+            # Skip field indicators themselves
+            if word_lower in field_indicators:
+                continue
+            
+            # For short words (2 chars), only keep if they look like acronyms (all caps)
+            if len(word_lower) <= 2:
+                if word.isupper() and len(word) >= 2:
+                    logger.info(f"🔍 Keeping acronym: {word}")
+                    meaningful_terms.append(word)  # Keep "IT", "HR", etc.
+                continue
+                
+            # Add other meaningful terms
+            meaningful_terms.append(word_lower)
+        
+        unique_terms = list(set(meaningful_terms))
+        
+        logger.info(f"🔍 Extracted search terms: {unique_terms}")
         return unique_terms
 
-    def query_structured_data(self, search_terms: List[str]) -> Dict[str, DatabaseResult]:
-        """Query structured data from database"""
+    def query_structured_data(self, search_terms: List[str], target_tables: Optional[List[str]] = None) -> Dict[str, DatabaseResult]:
+        """Query structured data from database with query expansion and smart routing"""
+        logger.info(f"📊 query_structured_data called with terms: {search_terms}, tables: {target_tables}")
+        logger.info(f"📊 _db_initialized: {self._db_initialized}")
+        
         if not self._db_initialized:
+            logger.warning("⚠️ Database not initialized, returning empty results")
             return {}
 
         try:
-            db_results = self.db_manager.search_accross_tables(search_terms, limit=config.db_result_limit)
+            # Apply query expansion to search terms
+            expanded_terms = self.expand_search_terms_for_db(search_terms)
+            logger.info(f"Original terms: {search_terms} -> Expanded: {expanded_terms}")
+            
+            # Use target tables if provided, otherwise search all
+            tables_to_search = target_tables if target_tables else config.db_tables
+            
+            db_results = self.db_manager.search_in_specific_tables(
+                expanded_terms, 
+                tables_to_search,
+                limit=config.db_result_limit
+            )
 
             formatted_results = {}
             for table_name, records in db_results.items():
@@ -461,14 +597,57 @@ JAWABAN:"""
 
             return formatted_results
         except Exception as e:
-            logger.error(f"Database not initialized: {e}")
+            logger.error(f"Database query failed: {e}")
             return {}
 
-    def hybrid_search(self, question: str, collection_ids: List[str] = None) -> Dict[str, Any]:
+    def expand_search_terms_for_db(self, search_terms: List[str]) -> List[str]:
+        """Expand search terms with synonyms and stemming for better DB matches"""
+        expanded = set(search_terms)
+        
+        for term in search_terms:
+            term_lower = term.lower()
+            
+            # Add synonyms from expansion dictionary
+            for key, synonyms in self.db_query_expansion_terms.items():
+                if key in term_lower or term_lower in synonyms:
+                    expanded.add(key)
+                    expanded.update(synonyms)
+            
+            # Apply simple Indonesian stemming
+            stemmed = self.simple_indonesian_stem(term_lower)
+            if stemmed != term_lower:
+                expanded.add(stemmed)
+        
+        return list(expanded)
+
+    def simple_indonesian_stem(self, word: str) -> str:
+        """Simple Indonesian stemming - remove common affixes"""
+        word = word.lower().strip()
+        
+        # Common Indonesian suffixes
+        suffixes = ['kan', 'an', 'i', 'nya', 'lah', 'kah']
+        prefixes = ['me', 'di', 'ke', 'se', 'ber', 'ter', 'pe']
+        
+        # Remove suffixes first
+        for suffix in suffixes:
+            if word.endswith(suffix) and len(word) > len(suffix) + 2:
+                word = word[:-len(suffix)]
+                break
+        
+        # Then remove prefixes
+        for prefix in prefixes:
+            if word.startswith(prefix) and len(word) > len(prefix) + 2:
+                word = word[len(prefix):]
+                break
+        
+        return word
+
+    def hybrid_search(self, question: str, collection_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """Perform hybrid search across both structured and unstructured data"""
 
         analysis = self.analyze_question_type(question)
         search_terms = analysis["search_terms"]
+        target_tables = analysis.get("target_tables", [])  # Get smart-routed tables
 
         pdf_docs = []
         if analysis["is_pdf_question"] or analysis["recommended_type"] == SearchType.HYBRID:
@@ -480,19 +659,22 @@ JAWABAN:"""
 
         db_results = {}
         if analysis["is_db_question"] or analysis["recommended_type"] == SearchType.HYBRID:
-            db_results = self.query_structured_data(search_terms)
+            # Pass target_tables for smart routing
+            db_results = self.query_structured_data(search_terms, target_tables)
 
         return {
             "pdf_documents": pdf_docs,
             "database_results": db_results,
             "search_analysis": analysis,
-            "search_terms": search_terms
+            "search_terms": search_terms,
+            "target_tables": target_tables  # Include for debugging/transparency
         }
 
     def generate_hybrid_answer(self, hybrid_results: Dict[str, Any], question: str) -> str:
-        """Generate answer combining both structured and unstructured data"""
+        """Generate answer combining both structured and unstructured data with relevance scoring"""
         pdf_docs = hybrid_results['pdf_documents']
         db_results = hybrid_results['database_results']
+        target_tables = hybrid_results.get('target_tables', [])
 
         has_pdf_results = len(pdf_docs) > 0
         has_db_results = len(db_results) > 0
@@ -503,39 +685,54 @@ JAWABAN:"""
         # Prepare context from both sources
         context_parts = []
 
-        # Add PDF context
+        # Add PDF context with confidence scores
         if has_pdf_results:
             context_parts.append("INFORMASI DARI DOKUMEN:")
             for i, doc in enumerate(pdf_docs[:3]): # limit to top 3 PDF results
-                source = doc.metadata.get('source', 'Unkown')
+                source = doc.metadata.get('source', 'Unknown')
                 page = doc.metadata.get('page', 'Unknown')
+                score = doc.metadata.get('similarity_score', 0)
                 truncated_content = self.truncate_context(doc.page_content, max_tokens=150)
-                context_parts.append(f"[Dokumen: {source}, Halaman: (page)]\n {truncated_content}\n")
+                context_parts.append(f"[Dokumen: {source}, Halaman: {page}, Relevansi: {score:.2f}]\n{truncated_content}\n")
 
+        # Add DB context with relevance scores
         if has_db_results:
             context_parts.append("INFORMASI DARI DATABASE:")
+            context_parts.append(f"(Tabel yang dicari: {', '.join(target_tables)})")
+            
             for table_name, db_result in db_results.items():
                 if db_result.record_count > 0:
-                    context_parts.append(f"Data dari table {table_name}")
-                    for i, record in enumerate(db_result.data[:2]): #Limit to 2 records per table
-                        record_str = ", ".join(f"{k}: {v}" for k, v in record.items() if not k.startswith('_')[:4])
-                        context_parts.append(f" - {record_str}")
+                    # Sort records by relevance_score if available
+                    sorted_records = sorted(
+                        db_result.data, 
+                        key=lambda x: x.get('relevance_score', 0), 
+                        reverse=True
+                    )
+                    
+                    context_parts.append(f"\\nData dari tabel {table_name} ({db_result.record_count} record):")
+                    for i, record in enumerate(sorted_records[:3]): # Limit to top 3 records
+                        relevance = record.get('relevance_score', 'N/A')
+                        # Filter out internal fields
+                        display_fields = {k: v for k, v in record.items() 
+                                         if not k.startswith('_') and k not in ['search_vector', 'relevance_score']}
+                        record_str = ", ".join(f"{k}: {v}" for k, v in list(display_fields.items())[:5])
+                        context_parts.append(f" - [Score: {relevance}] {record_str}")
 
-                    if db_result.record_count > 2:
-                        context_parts.append(f"- ... dan {db_result.record_count - 2} record lainnya\n")
+                    if db_result.record_count > 3:
+                        context_parts.append(f" - ... dan {db_result.record_count - 3} record lainnya")
 
         context = "\n".join(context_parts)
-        context = self.truncate_context(context, max_tokens=400)
+        context = self.truncate_context(context, max_tokens=500)
 
-         # Enhanced prompt for hybrid answers
+        # Enhanced prompt for hybrid answers
         prompt_template = """Berdasarkan informasi dari dokumen dan database berikut, jawab pertanyaan dengan jelas dan akurat. 
-            Sertakan informasi dari kedua sumber jika relevan.
+Sertakan informasi dari kedua sumber jika relevan. Prioritaskan informasi dengan skor relevansi tinggi.
 
-            {context}
+{context}
 
-            PERTANYAAN: {question}
+PERTANYAAN: {question}
 
-            JAWABAN:"""
+JAWABAN:"""
 
         prompt = prompt_template.format(context=context, question=question)
 

@@ -2,8 +2,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import logging
 from config import Config
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +108,72 @@ class DatabaseManager:
 
                 self.connection.commit()
                 logger.info("Dummy data initialized in database")
+                
+                # Initialize Full-Text Search
+                self.initialize_fts()
+                
         except Exception as e:
             logger.error(f"Failed to initialize dummy data: {e}")
             self.connection.rollback()
-            
+
+    def initialize_fts(self):
+        """Initialize Full-Text Search with tsvector columns and GIN indexes"""
+        try:
+            with self.connection.cursor() as cursor:
+                # Create pg_trgm extension for fuzzy matching (if available)
+                try:
+                    cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+                    logger.info("pg_trgm extension enabled")
+                except Exception as e:
+                    logger.warning(f"pg_trgm extension not available: {e}")
+
+                # Add tsvector columns and triggers for each table
+                fts_configs = [
+                    ('user_profiles', ['name', 'email', 'department', 'position']),
+                    ('products', ['name', 'category', 'description']),
+                    ('orders', ['status'])
+                ]
+
+                for table_name, text_columns in fts_configs:
+                    # Check if search_vector column exists
+                    cursor.execute("""
+                        SELECT column_name FROM information_schema.columns 
+                        WHERE table_name = %s AND column_name = 'search_vector'
+                    """, (table_name,))
+                    
+                    if not cursor.fetchone():
+                        # Add tsvector column
+                        cursor.execute(f"""
+                            ALTER TABLE {table_name} 
+                            ADD COLUMN IF NOT EXISTS search_vector tsvector;
+                        """)
+                        
+                        # Build tsvector from text columns
+                        coalesce_parts = " || ' ' || ".join(
+                            [f"COALESCE({col}::text, '')" for col in text_columns]
+                        )
+                        
+                        # Update existing rows
+                        cursor.execute(f"""
+                            UPDATE {table_name} 
+                            SET search_vector = to_tsvector('indonesian', {coalesce_parts})
+                            WHERE search_vector IS NULL;
+                        """)
+                        
+                        # Create GIN index for fast search
+                        cursor.execute(f"""
+                            CREATE INDEX IF NOT EXISTS idx_{table_name}_search 
+                            ON {table_name} USING GIN(search_vector);
+                        """)
+                        
+                        logger.info(f"FTS initialized for table {table_name}")
+
+                self.connection.commit()
+                logger.info("Full-Text Search initialization completed")
+                
+        except Exception as e:
+            logger.warning(f"FTS initialization failed (will use fallback ILIKE): {e}")
+            self.connection.rollback()
 
     def get_table_schema(self, table_name: str) -> List[Dict[str, Any]]:
         """Get schema information for a table"""
@@ -158,6 +221,33 @@ class DatabaseManager:
             
         return results
 
+    def search_in_specific_tables(self, search_terms: List[str], tables: List[str], limit: int = 10) -> Dict[str, List[Dict[str, Any]]]:
+        """Search across specific tables only (smart routing)"""
+        logger.info(f"🔎 search_in_specific_tables called with terms: {search_terms}, tables: {tables}")
+        results = {}
+        
+        configured_tables = Config().db_tables
+        logger.info(f"🔎 Configured tables: {configured_tables}")
+        
+        for table_name in tables:
+            if table_name not in configured_tables:
+                logger.warning(f"Table {table_name} not in configured tables, skipping")
+                continue
+            
+            logger.info(f"🔎 Searching in table: {table_name}")
+            try:
+                table_results = self.search_in_table(table_name, search_terms, limit)
+                logger.info(f"🔎 Got {len(table_results) if table_results else 0} results from {table_name}")
+                if table_results:
+                    results[table_name] = table_results
+                    logger.info(f"Found {len(table_results)} results in {table_name}")
+            except Exception as e:
+                logger.error(f"Search in table {table_name} failed: {e}")
+                continue
+        
+        logger.info(f"🔎 Total results: {results}")
+        return results
+
     # def search_in_table(self, table_name: str, search_terms: List[str], limit: int = 10) -> List[Dict[str, Any]]:
     #     """Search for accross all columns in a table"""
     #     try:
@@ -196,32 +286,137 @@ class DatabaseManager:
     #         return []
     # database.py - Add this method if not exists
     def search_in_table(self, table_name: str, search_terms: List[str], limit: int = 10) -> List[Dict[str, Any]]:
-        """Search for terms across all columns in a table"""
+        """Search for terms across all columns in a table with FTS and scoring"""
+        try:
+            # Try Full-Text Search first
+            results = self.search_with_fts(table_name, search_terms, limit)
+            if results:
+                return results
+            
+            # Fallback to ILIKE if FTS fails or returns no results
+            return self.search_with_ilike(table_name, search_terms, limit)
+            
+        except Exception as e:
+            logger.error(f"Search in table {table_name} failed: {str(e)}")
+            return []
+
+    def search_with_fts(self, table_name: str, search_terms: List[str], limit: int = 10) -> List[Dict[str, Any]]:
+        """Full-Text Search with ts_rank scoring - uses OR logic for multiple terms"""
+        try:
+            # Check if table has search_vector column
+            schema = self.get_table_schema(table_name)
+            has_fts = any(col['column_name'] == 'search_vector' for col in schema)
+            
+            if not has_fts:
+                return []
+            
+            # Build tsquery from search terms with OR logic
+            # Each term is searched separately and combined with OR (|)
+            stemmed_terms = [self.indonesian_stem(term.lower()) for term in search_terms]
+            # Filter out empty terms and create tsquery format
+            valid_terms = [t for t in stemmed_terms if t and len(t) >= 2]
+            
+            if not valid_terms:
+                logger.info(f"No valid terms for FTS in {table_name}")
+                return []
+            
+            # Use to_tsquery with OR logic: term1:* | term2:* (prefix matching)
+            query_parts = [f"{term}:*" for term in valid_terms]
+            tsquery_string = ' | '.join(query_parts)
+            
+            logger.info(f"🔍 FTS query for {table_name}: {tsquery_string}")
+            
+            query = f"""
+                SELECT *, 
+                       ts_rank(search_vector, to_tsquery('simple', %s)) as relevance_score
+                FROM {table_name}
+                WHERE search_vector @@ to_tsquery('simple', %s)
+                ORDER BY relevance_score DESC
+                LIMIT %s
+            """
+            
+            results = self.execute_query(query, (tsquery_string, tsquery_string, limit))
+            
+            logger.info(f"FTS found {len(results)} results in {table_name}")
+            return results
+            
+        except Exception as e:
+            logger.warning(f"FTS search failed for {table_name}: {e}")
+            return []
+
+    def search_with_ilike(self, table_name: str, search_terms: List[str], limit: int = 10) -> List[Dict[str, Any]]:
+        """Fallback ILIKE search with basic scoring - case insensitive"""
         try:
             schema = self.get_table_schema(table_name)
             text_columns = [col['column_name'] for col in schema 
-                        if col['data_type'] in ['text', 'character varying', 'varchar']]
+                        if col['data_type'] in ['text', 'character varying', 'varchar']
+                        and col['column_name'] != 'search_vector']
             
             if not text_columns:
                 return []
             
+            # Build conditions for WHERE clause
             conditions = []
-            params = []
+            where_params = []
+            
+            # Build score expression separately
+            score_parts = []
+            score_params = []
             
             for column in text_columns:
                 for term in search_terms:
-                    conditions.append(f"{column} ILIKE %s")
-                    params.append(f"%{term}%")
+                    # For WHERE clause
+                    conditions.append(f"LOWER({column}) LIKE LOWER(%s)")
+                    where_params.append(f"%{term}%")
+                    
+                    # For score calculation
+                    score_parts.append(f"CASE WHEN LOWER({column}) LIKE LOWER(%s) THEN 1 ELSE 0 END")
+                    score_params.append(f"%{term}%")
             
+            score_expr = " + ".join(score_parts) if score_parts else "0"
             where_clause = " OR ".join(conditions)
-            query = f"SELECT * FROM {table_name} WHERE {where_clause} LIMIT %s"
-            params.append(str(limit))
             
-            return self.execute_query(query, tuple(params))
+            # Parameters order: score_params first, then where_params, then limit
+            all_params = score_params + where_params + [limit]
+            
+            query = f"""
+                SELECT *, ({score_expr}) as relevance_score 
+                FROM {table_name} 
+                WHERE {where_clause} 
+                ORDER BY relevance_score DESC
+                LIMIT %s
+            """
+            
+            logger.info(f"🔍 ILIKE search in {table_name} for terms: {search_terms}")
+            results = self.execute_query(query, tuple(all_params))
+            logger.info(f"ILIKE found {len(results)} results in {table_name}")
+            return results
             
         except Exception as e:
-            logger.error(f"Search in table {table_name} failed: {str(e)}")
-            return []  
+            logger.error(f"ILIKE search in table {table_name} failed: {str(e)}")
+            return []
+
+    def indonesian_stem(self, word: str) -> str:
+        """Simple Indonesian stemming - remove common suffixes"""
+        word = word.lower().strip()
+        
+        # Common Indonesian suffixes
+        suffixes = ['kan', 'an', 'i', 'nya', 'lah', 'kah', 'pun']
+        prefixes = ['me', 'di', 'ke', 'se', 'ber', 'ter', 'pe']
+        
+        # Remove suffixes
+        for suffix in suffixes:
+            if word.endswith(suffix) and len(word) > len(suffix) + 2:
+                word = word[:-len(suffix)]
+                break
+        
+        # Remove prefixes
+        for prefix in prefixes:
+            if word.startswith(prefix) and len(word) > len(prefix) + 2:
+                word = word[len(prefix):]
+                break
+        
+        return word  
       
     def get_table_sample(self, table_name: str,limit: int = 5) -> List[Dict[str, Any]]:
         """Get sample rows from a table"""

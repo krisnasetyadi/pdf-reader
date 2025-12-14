@@ -69,14 +69,16 @@ async def hybrid_query(request: HybridQueryRequest):
             pdf_sources.append(source_info)
 
         # Log search results
-        logger.info(f"✅ Search completed - PDFs: {len(pdf_sources)}, DB tables: {len(hybrid_results.get('database_results', {}))}")
+        target_tables = hybrid_results.get('target_tables', [])
+        logger.info(f"✅ Search completed - PDFs: {len(pdf_sources)}, DB tables: {len(hybrid_results.get('database_results', {}))}, Target tables: {target_tables}")
 
         return HybridResponse(
             answer=answer,
             pdf_sources=pdf_sources,
             db_results=hybrid_results.get('database_results', {}),
             processing_time=processing_time,
-            search_terms=hybrid_results.get('search_terms', [])
+            search_terms=hybrid_results.get('search_terms', []),
+            target_tables=target_tables
         )
     
     except HTTPException:

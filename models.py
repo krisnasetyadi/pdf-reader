@@ -52,6 +52,7 @@ class DatabaseResult(BaseModel):
     table: str
     data: List[Dict[str, Any]]
     record_count: int
+    avg_relevance_score: Optional[float] = None  # Average score dari search results
 
 # models.py - Add these fields to HybridQueryRequest
 class HybridQueryRequest(BaseModel):
@@ -73,6 +74,7 @@ class HybridResponse(BaseModel):
     db_results: Dict[str, Any]
     processing_time: float
     search_terms: List[str]
+    target_tables: Optional[List[str]] = None  # Tables that were searched (smart routing)
 
     # answer: str
     # pdf_sources: List[str]
@@ -94,3 +96,22 @@ class StructuredQueryResponse(BaseModel):
     table_used: str
     sql_query: Optional[str] = None
     processing_time: float
+
+class JoinQueryRequest(BaseModel):
+    question: str
+    join_type: Optional[str] = "auto"  # auto, inner, left, cross
+    limit: int = 20
+
+class JoinQueryResponse(BaseModel):
+    answer: str
+    data: List[Dict[str, Any]]
+    tables_used: List[str]
+    join_conditions: List[Dict[str, str]]
+    sql_query: Optional[str] = None
+    processing_time: float
+
+class TableRelationship(BaseModel):
+    table1: str
+    table2: str
+    join_condition: str
+    relationship_type: str 

@@ -60,12 +60,14 @@ from router.query import router as query_router
 from router.collections import router as collections_router
 from router.hybrid import router as hybrid_router
 from router.structured import router as structured_router
+from router.join import router as join_router
 
 app.include_router(upload_router, prefix="/api/v1")
 app.include_router(query_router, prefix="/api/v1")
 app.include_router(collections_router, prefix="/api/v1")
 app.include_router(hybrid_router, prefix="/api/v1")
 app.include_router(structured_router, prefix="/api/v1")
+app.include_router(join_router, prefix="/api/v1")
     
 # except ImportError as e:
 #     logger.warning(
