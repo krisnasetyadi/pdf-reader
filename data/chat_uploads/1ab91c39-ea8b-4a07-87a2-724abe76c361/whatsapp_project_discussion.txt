@@ -1,0 +1,60 @@
+[15/12/2025, 08:30:15] Ahmad Wijaya: Selamat pagi tim. Reminder untuk meeting kick-off proyek ERP Integration jam 10.00 ya
+[15/12/2025, 08:31:02] Sari Dewi: Siap pak. Saya sudah siapkan BRD draft nya
+[15/12/2025, 08:32:45] Rizki Pratama: Noted pak. Environment staging sudah saya prepare
+[15/12/2025, 08:35:22] Budi Santoso: Pagi pak. Mau konfirmasi, ini mengikuti SOP yang mana ya? Yang SOP-IT-001 versi 2.0?
+[15/12/2025, 08:36:10] Ahmad Wijaya: Betul Budi. Ikuti SOP-IT-001. Semua dokumen wajib sesuai BAB 5 ya
+[15/12/2025, 08:38:55] Maya Sari: Pak Ahmad, untuk testing ini pakai pendekatan apa? Agile atau waterfall?
+[15/12/2025, 08:40:12] Ahmad Wijaya: Kita pakai Agile. Sprint 2 minggu sesuai SOP. Nanti UAT nya sesuai fase 3.4
+[15/12/2025, 08:42:30] Sari Dewi: Pak, untuk requirement gathering ini saya perlu akses ke data user yang ada di database. Yang di tabel user_profiles
+[15/12/2025, 08:43:45] Rizki Pratama: Sari bisa langsung request ke saya. Nanti saya kasih read access ke staging
+[15/12/2025, 08:45:00] Budi Santoso: Oh iya, soal deployment nanti, kita ikuti prosedur di BAB 3.5 ya? Yang harus backup dulu dan deployment malam?
+[15/12/2025, 08:46:22] Ahmad Wijaya: Iya betul. Deployment harus jam non-peak. Biasanya kita jam 10 malam atau weekend
+[15/12/2025, 08:48:10] Maya Sari: Untuk coverage testing, minimal berapa persen pak sesuai SOP?
+[15/12/2025, 08:49:30] Ahmad Wijaya: Unit test coverage minimal 70% sesuai standar di bagian fase development
+[15/12/2025, 09:15:45] Sari Dewi: Tim, saya baru cek di database ada 5 user aktif di tabel user_profiles. Ahmad di IT, saya di HR, Budi di Finance, Maya Marketing, dan Rizki IT juga
+[15/12/2025, 09:17:20] Budi Santoso: Oke noted. Berarti untuk testing nanti kita bisa pakai data user yang ada
+[15/12/2025, 09:20:00] Ahmad Wijaya: Btw soal approval, kalau proyek ini estimasi budgetnya berapa?
+[15/12/2025, 09:22:35] Sari Dewi: Estimasi sekitar 150 juta pak
+[15/12/2025, 09:24:10] Ahmad Wijaya: Kalau 150 juta berarti approval nya harus ke Direktur IT sesuai approval matrix di BAB 4.1
+[15/12/2025, 09:26:45] Rizki Pratama: Pak, untuk database design nanti reference nya ke products table yang sudah ada atau bikin baru?
+[15/12/2025, 09:28:30] Budi Santoso: Kita extend dari yang ada aja Riz. Tabel products sama orders sudah ada struktur yang bagus
+[15/12/2025, 09:30:15] Ahmad Wijaya: Setuju. Leverage existing database. Nanti di design document jelaskan relasinya
+[15/12/2025, 09:45:00] Maya Sari: Tim, mau tanya. Kalau ada bug critical setelah go-live, SLA nya berapa lama ya?
+[15/12/2025, 09:47:22] Ahmad Wijaya: Cek di BAB 6.2. Critical itu response time 30 menit, resolution 4 jam
+[15/12/2025, 09:50:10] Sari Dewi: Pak Ahmad, nanti dokumen project ini kita simpan di SharePoint dengan struktur folder yang di SOP kan?
+[15/12/2025, 09:52:45] Ahmad Wijaya: Betul Sari. Ikuti struktur di BAB 5.2. Mulai dari folder 01_Initiation sampai 07_Maintenance
+[15/12/2025, 10:00:00] Ahmad Wijaya: Oke tim, meeting dimulai. Semua sudah join?
+[15/12/2025, 10:01:15] Sari Dewi: Sudah pak
+[15/12/2025, 10:01:20] Budi Santoso: Ready
+[15/12/2025, 10:01:25] Rizki Pratama: Siap
+[15/12/2025, 10:01:30] Maya Sari: Hadir pak
+[15/12/2025, 11:30:00] Ahmad Wijaya: Meeting selesai. Summary: sprint pertama fokus di modul inventory. PIC Budi untuk development, Maya untuk testing
+[15/12/2025, 11:32:15] Budi Santoso: Siap pak. Target 2 minggu sesuai durasi sprint di SOP
+[15/12/2025, 11:35:40] Maya Sari: Noted. Saya akan prepare test cases sesuai requirement dari Sari
+[15/12/2025, 11:38:20] Rizki Pratama: Saya akan siapkan environment development dan staging hari ini
+[15/12/2025, 11:40:55] Sari Dewi: Saya akan finalize BRD dan share ke SharePoint folder 02_Requirements hari ini
+[15/12/2025, 14:00:30] Budi Santoso: Update: saya sudah mulai setup project structure. Pakai Git dengan branching strategy main > develop > feature sesuai standar coding di SOP
+[15/12/2025, 14:05:45] Rizki Pratama: Environment dev sudah ready. Connection string dan credential sudah saya share via secure channel
+[15/12/2025, 14:10:20] Ahmad Wijaya: Good progress tim. Reminder: jangan hardcode credentials ya sesuai standar keamanan BAB 7.2
+[15/12/2025, 14:15:00] Budi Santoso: Siap pak. Semua credentials pakai environment variables
+[15/12/2025, 15:30:45] Maya Sari: Tim, saya sudah buat draft test cases untuk modul inventory. Total 25 test cases
+[15/12/2025, 15:35:20] Sari Dewi: Maya bisa share ke saya? Mau saya review dulu sebelum testing
+[15/12/2025, 15:38:10] Maya Sari: Sudah saya upload ke SharePoint folder 05_Testing
+[15/12/2025, 16:00:00] Ahmad Wijaya: Bagus tim. Keep up the good work. Besok kita daily standup jam 9 pagi ya
+[15/12/2025, 16:02:30] Sari Dewi: Siap pak
+[15/12/2025, 16:03:15] Budi Santoso: Oke pak
+[15/12/2025, 16:04:00] Rizki Pratama: Noted
+[15/12/2025, 16:05:22] Maya Sari: Baik pak
+[16/12/2025, 09:00:15] Ahmad Wijaya: Selamat pagi. Daily standup dimulai. Progress masing-masing?
+[16/12/2025, 09:02:30] Budi Santoso: Saya sudah selesai setup database schema. Table products dan orders sudah di-extend untuk modul inventory
+[16/12/2025, 09:05:45] Rizki Pratama: Database di staging sudah sync dengan development. Backup schedule juga sudah running
+[16/12/2025, 09:08:20] Sari Dewi: BRD sudah final dan approved oleh pak Ahmad kemarin malam
+[16/12/2025, 09:10:55] Maya Sari: Test cases sudah di-review Sari. Ada 3 test case tambahan jadi total 28
+[16/12/2025, 09:15:00] Ahmad Wijaya: Excellent. Target hari ini apa?
+[16/12/2025, 09:17:30] Budi Santoso: Saya akan mulai develop API untuk CRUD inventory. Target 5 endpoint hari ini
+[16/12/2025, 09:20:10] Maya Sari: Saya akan setup automation testing framework
+[16/12/2025, 09:22:45] Rizki Pratama: Saya monitoring dan prepare CI/CD pipeline
+[16/12/2025, 09:25:00] Ahmad Wijaya: Oke good. Ada blocker?
+[16/12/2025, 09:27:30] Budi Santoso: Tidak ada pak. Lancar semua
+[16/12/2025, 09:28:15] Maya Sari: Clear pak
+[16/12/2025, 09:30:00] Ahmad Wijaya: Bagus. Lanjut kerja. Update lagi nanti sore

@@ -57,22 +57,15 @@ async def health_check():
     }
 
 # Include routers
-# try:
 from router.upload import router as upload_router
-from router.query import router as query_router
 from router.collections import router as collections_router
 from router.hybrid import router as hybrid_router
-from router.structured import router as structured_router
-from router.join import router as join_router
-from router.chat import router as chat_router  
+from router.chat import router as chat_router
 
-app.include_router(upload_router, prefix="/api/v1")
-app.include_router(query_router, prefix="/api/v1")
-app.include_router(collections_router, prefix="/api/v1")
-app.include_router(hybrid_router, prefix="/api/v1")
-app.include_router(structured_router, prefix="/api/v1")
-app.include_router(join_router, prefix="/api/v1")
-app.include_router(chat_router, prefix="/api/v1")  
+app.include_router(upload_router, prefix="/api/v1")       # PDF upload
+app.include_router(collections_router, prefix="/api/v1")  # PDF collections management
+app.include_router(hybrid_router, prefix="/api/v1")       # Main hybrid search (PDF + DB + Chat)
+app.include_router(chat_router, prefix="/api/v1")         # Chat upload & collections  
     
 # except ImportError as e:
 #     logger.warning(

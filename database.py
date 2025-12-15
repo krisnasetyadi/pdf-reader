@@ -284,24 +284,57 @@ class DatabaseManager:
     #     except Exception as e:
     #         logger.error(f"Failed to search in table {table_name}: {e}")
     #         return []
+    
+    # Common phrases that should be searched together
+    PHRASE_PATTERNS = {
+        ('project', 'manager'): 'project manager',
+        ('tech', 'lead'): 'tech lead',
+        ('qa', 'lead'): 'qa lead',
+        ('backend', 'developer'): 'backend developer',
+        ('frontend', 'developer'): 'frontend developer',
+        ('devops', 'engineer'): 'devops engineer',
+        ('finance', 'manager'): 'finance manager',
+        ('hr', 'manager'): 'hr manager',
+        ('it', 'director'): 'it director',
+        ('business', 'analyst'): 'business analyst',
+    }
+    
+    def detect_phrases(self, search_terms: List[str]) -> tuple[List[str], List[str]]:
+        """Detect common phrases in search terms and return (phrases, remaining_terms)"""
+        terms_lower = [t.lower() for t in search_terms]
+        detected_phrases = []
+        used_terms = set()
+        
+        for (word1, word2), phrase in self.PHRASE_PATTERNS.items():
+            if word1 in terms_lower and word2 in terms_lower:
+                detected_phrases.append(phrase)
+                used_terms.add(word1)
+                used_terms.add(word2)
+        
+        remaining_terms = [t for t in search_terms if t.lower() not in used_terms]
+        return detected_phrases, remaining_terms
+    
     # database.py - Add this method if not exists
     def search_in_table(self, table_name: str, search_terms: List[str], limit: int = 10) -> List[Dict[str, Any]]:
         """Search for terms across all columns in a table with FTS and scoring"""
         try:
+            # Detect phrases first
+            phrases, remaining_terms = self.detect_phrases(search_terms)
+            
             # Try Full-Text Search first
-            results = self.search_with_fts(table_name, search_terms, limit)
+            results = self.search_with_fts(table_name, search_terms, limit, phrases)
             if results:
                 return results
             
             # Fallback to ILIKE if FTS fails or returns no results
-            return self.search_with_ilike(table_name, search_terms, limit)
+            return self.search_with_ilike(table_name, search_terms, limit, phrases)
             
         except Exception as e:
             logger.error(f"Search in table {table_name} failed: {str(e)}")
             return []
 
-    def search_with_fts(self, table_name: str, search_terms: List[str], limit: int = 10) -> List[Dict[str, Any]]:
-        """Full-Text Search with ts_rank scoring - uses OR logic for multiple terms"""
+    def search_with_fts(self, table_name: str, search_terms: List[str], limit: int = 10, phrases: List[str] = None) -> List[Dict[str, Any]]:
+        """Full-Text Search with ts_rank scoring - prioritizes phrase matches"""
         try:
             # Check if table has search_vector column
             schema = self.get_table_schema(table_name)
@@ -326,16 +359,63 @@ class DatabaseManager:
             
             logger.info(f"🔍 FTS query for {table_name}: {tsquery_string}")
             
-            query = f"""
-                SELECT *, 
-                       ts_rank(search_vector, to_tsquery('simple', %s)) as relevance_score
-                FROM {table_name}
-                WHERE search_vector @@ to_tsquery('simple', %s)
-                ORDER BY relevance_score DESC
-                LIMIT %s
-            """
+            # Get text columns for phrase matching boost
+            text_columns = [col['column_name'] for col in schema 
+                           if col['data_type'] in ['text', 'character varying', 'varchar']
+                           and col['column_name'] != 'search_vector']
             
-            results = self.execute_query(query, (tsquery_string, tsquery_string, limit))
+            # Build phrase boost expressions if phrases detected
+            phrase_boost_parts = []
+            phrase_params = []
+            if phrases:
+                for phrase in phrases:
+                    for col in text_columns:
+                        # Boost score by 10 if exact phrase found
+                        phrase_boost_parts.append(f"CASE WHEN LOWER({col}) LIKE LOWER(%s) THEN 10.0 ELSE 0.0 END")
+                        phrase_params.append(f"%{phrase}%")
+            
+            if phrase_boost_parts:
+                phrase_boost_expr = " + ".join(phrase_boost_parts)
+                query = f"""
+                    SELECT *, 
+                           ts_rank(search_vector, to_tsquery('simple', %s)) + ({phrase_boost_expr}) as relevance_score
+                    FROM {table_name}
+                    WHERE search_vector @@ to_tsquery('simple', %s)
+                    ORDER BY relevance_score DESC
+                    LIMIT %s
+                """
+                params = tuple([tsquery_string] + phrase_params + [tsquery_string, limit])
+            else:
+                query = f"""
+                    SELECT *, 
+                           ts_rank(search_vector, to_tsquery('simple', %s)) as relevance_score
+                    FROM {table_name}
+                    WHERE search_vector @@ to_tsquery('simple', %s)
+                    ORDER BY relevance_score DESC
+                    LIMIT %s
+                """
+                params = (tsquery_string, tsquery_string, limit)
+            
+            results = self.execute_query(query, params)
+            
+            # Post-filter: If phrases detected, prioritize exact phrase matches
+            if phrases and results:
+                def has_phrase_match(record):
+                    for col in text_columns:
+                        val = str(record.get(col, '')).lower()
+                        for phrase in phrases:
+                            if phrase.lower() in val:
+                                return True
+                    return False
+                
+                # Separate exact matches from partial matches
+                exact_matches = [r for r in results if has_phrase_match(r)]
+                partial_matches = [r for r in results if not has_phrase_match(r)]
+                
+                # If we have exact matches, return only those (up to limit)
+                if exact_matches:
+                    logger.info(f"🎯 Found {len(exact_matches)} exact phrase matches in {table_name}")
+                    return exact_matches[:limit]
             
             logger.info(f"FTS found {len(results)} results in {table_name}")
             return results
@@ -344,8 +424,8 @@ class DatabaseManager:
             logger.warning(f"FTS search failed for {table_name}: {e}")
             return []
 
-    def search_with_ilike(self, table_name: str, search_terms: List[str], limit: int = 10) -> List[Dict[str, Any]]:
-        """Fallback ILIKE search with basic scoring - case insensitive"""
+    def search_with_ilike(self, table_name: str, search_terms: List[str], limit: int = 10, phrases: List[str] = None) -> List[Dict[str, Any]]:
+        """Fallback ILIKE search with basic scoring - case insensitive, prioritizes phrase matches"""
         try:
             schema = self.get_table_schema(table_name)
             text_columns = [col['column_name'] for col in schema 
@@ -363,6 +443,16 @@ class DatabaseManager:
             score_parts = []
             score_params = []
             
+            # Add phrase matching with higher score (10 points per phrase match)
+            if phrases:
+                for column in text_columns:
+                    for phrase in phrases:
+                        conditions.append(f"LOWER({column}) LIKE LOWER(%s)")
+                        where_params.append(f"%{phrase}%")
+                        score_parts.append(f"CASE WHEN LOWER({column}) LIKE LOWER(%s) THEN 10 ELSE 0 END")
+                        score_params.append(f"%{phrase}%")
+            
+            # Add individual term matching (1 point per term match)
             for column in text_columns:
                 for term in search_terms:
                     # For WHERE clause
@@ -387,7 +477,7 @@ class DatabaseManager:
                 LIMIT %s
             """
             
-            logger.info(f"🔍 ILIKE search in {table_name} for terms: {search_terms}")
+            logger.info(f"🔍 ILIKE search in {table_name} for terms: {search_terms}, phrases: {phrases}")
             results = self.execute_query(query, tuple(all_params))
             logger.info(f"ILIKE found {len(results)} results in {table_name}")
             return results
