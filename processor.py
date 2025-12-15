@@ -107,65 +107,6 @@ class PDFQAProcessor:
 
         return list(set(expanded_queries))
 
- #    # def initialize_components(self):
-    #     """Initialize ML components with thread safety"""
-    #     with self._init_lock:
-    #         if self._initialized:
-    #             return
-
-    #         logger.info("Initializing NLP components...")
-    #         try:
-    #             # Initialize embeddings first (faster to load)
-    #             self.embeddings = HuggingFaceEmbeddings(
-    #                 model_name=config.embedding_model,
-    #                 model_kwargs={
-    #                     'device': 'cuda' if torch.cuda.is_available()
-    #                     else 'cpu'
-    #                 },
-    #                 encode_kwargs={'normalize_embeddings': True}
-    #             )
-
-    #             # Initialize LLM components
-    #             self.tokenizer = AutoTokenizer.from_pretrained(
-    #                 config.model_name)
-
-    #             # Add padding token if it doesn't exist
-    #             if self.tokenizer.pad_token is None:
-    #                 self.tokenizer.pad_token = self.tokenizer.eos_token
-
-    #             model = AutoModelForSeq2SeqLM.from_pretrained(
-    #                 config.model_name,
-    #                 device_map="auto",
-    #                 torch_dtype=torch.float16 if torch.cuda.is_available()
-    #                 else torch.float32,
-    #                 low_cpu_mem_usage=True
-    #             )
-
-    #             generation_config = GenerationConfig(
-    #                 max_new_tokens=config.max_new_tokens,
-    #                 temperature=config.temperature,
-    #                 do_sample=True,
-    #                 top_p=0.9,
-    #                 repetition_penalty=1.1,
-    #                 pad_token_id=self.tokenizer.pad_token_id
-    #             )
-
-    #             pipe = pipeline(
-    #                 "text2text-generation",
-    #                 model=model,
-    #                 tokenizer=self.tokenizer,
-    #                 generation_config=generation_config,
-    #                 batch_size=4 if torch.cuda.is_available() else 1
-    #             )
-
-    #             self.llm = HuggingFacePipeline(pipeline=pipe)
-    #             self._initialized = True
-    #             logger.info("Components initialized successfully")
-
-    #         except Exception as e:
-    #             logger.error(f"Failed to initialize components: {str(e)}")
-    #             raise
-
     def get_vector_store(self, collection_id):
         """Get vector store from cache or load from disk with thread safety"""
         with self._cache_lock:
@@ -419,8 +360,7 @@ JAWABAN:"""
         """Initialize database connection"""
         try:
             self.db_manager = db_manager
-            self._db_initialized = True  # Fixed: use underscore prefix
-            print('masuk db')
+            self._db_initialized = True
             logger.info("Database initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
@@ -493,7 +433,6 @@ JAWABAN:"""
                 self.llm = HuggingFacePipeline(pipeline=pipe)
 
                 self.initialize_database()
-                print('nyampe')
             
                 self._initialized = True
                 logger.info(f"All components initialized successfully with model: {config.model_name}")

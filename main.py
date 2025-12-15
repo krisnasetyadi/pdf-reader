@@ -5,7 +5,6 @@ import os
 import logging
 from config import config
 from processor import processor
-# import asyncio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,11 +64,7 @@ from router.chat import router as chat_router
 app.include_router(upload_router, prefix="/api/v1")       # PDF upload
 app.include_router(collections_router, prefix="/api/v1")  # PDF collections management
 app.include_router(hybrid_router, prefix="/api/v1")       # Main hybrid search (PDF + DB + Chat)
-app.include_router(chat_router, prefix="/api/v1")         # Chat upload & collections  
-    
-# except ImportError as e:
-#     logger.warning(
-#         f"Router import failed: {e}. Some endpoints may not be available.")
+app.include_router(chat_router, prefix="/api/v1")         # Chat upload & collections
 
 
 @app.get("/")

@@ -70,7 +70,6 @@ class DatabaseManager:
               
                 """)
 
-                print('executed')
                 cursor.execute("SELECT COUNT(*) FROM user_profiles;")
 
                 if cursor.fetchone()['count'] == 0:
@@ -196,14 +195,9 @@ class DatabaseManager:
         try:
             with self.connection.cursor() as cursor:
                 cursor.execute(query, params)
-                # if cursor.description:
                 return cursor.fetchall()
-                # self.connection.commit()
-                # return []
         except Exception as e:
             logger.error(f"Query execution failed: {e}")
-            # self.connection.rollback()
-            # return []
             raise
     
     def search_accross_tables(self, search_terms: List[str], limit: int = 10) -> Dict[str, List[Dict[str, Any]]]:
@@ -247,43 +241,6 @@ class DatabaseManager:
         
         logger.info(f"🔎 Total results: {results}")
         return results
-
-    # def search_in_table(self, table_name: str, search_terms: List[str], limit: int = 10) -> List[Dict[str, Any]]:
-    #     """Search for accross all columns in a table"""
-    #     try:
-    #        schema = self.get_table_schema(table_name)
-    #        text_columns = [col['column_name'] for col in schema
-    #                        if col['data_type'] in ['character varying', 'text', 'varchar']]
-    #        print(f"🔍 Searching in table: {table_name}")
-    #        print(f"📝 Search terms: {search_terms}")
-    #        print(f"📊 Text columns: {text_columns}")
-    #        if not text_columns:
-    #            return []
-
-    #        conditions = []
-    #        params = []
-
-    #        for column in text_columns:
-    #            for term in search_terms:
-    #                conditions.append(f"{column} ILIKE %s")
-    #                params.append(f"%{term}%")
-
-    #        where_clause = " OR ".join(conditions)
-    #        query = f"""
-    #            SELECT * FROM {table_name}
-    #            WHERE {where_clause}
-    #            LIMIT %s
-    #        """
-
-    #        params.append(limit)
-    #        print(f"📋 SQL Query: {query}")
-    #        print(f"🔢 Query params: {params}")
-    #        results = self.execute_query(query, tuple(params))
-    #        print(f"✅ Found {len(results)} results in table {table_name}")
-    #        return results
-    #     except Exception as e:
-    #         logger.error(f"Failed to search in table {table_name}: {e}")
-    #         return []
     
     # Common phrases that should be searched together
     PHRASE_PATTERNS = {
