@@ -1,0 +1,15 @@
+{
+  "collection_id": "650a750c-32fc-4366-a9cd-815af2d1ff7f",
+  "platform": "whatsapp",
+  "file_name": "dummy-chat-logs.txt",
+  "message_count": 3,
+  "date_range": {
+    "start": "2025-12-15T09:30:45",
+    "end": "2025-12-15T09:32:15"
+  },
+  "participants": [
+    "Jane Smith",
+    "John Doe"
+  ],
+  "created_at": "2025-12-15T11:28:38.226307"
+}

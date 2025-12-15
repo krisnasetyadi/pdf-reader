@@ -2,11 +2,19 @@
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from enum import Enum
+from datetime import datetime
 
 class SearchType(str, Enum):
     UNSTRUCTURED = "unstructured"
     STRUCTURED = "structured"
     HYBRID = "hybrid"
+
+class ChatPlatform(str, Enum):
+    WHATSAPP = "whatsapp"
+    TEAMS = "teams"
+    SLACK = "slack"
+    TELEGRAM = "telegram"
+    GENERIC = "generic"
 
 class QueryIntent(str, Enum):
     COUNT = "count"
@@ -60,6 +68,7 @@ class HybridQueryRequest(BaseModel):
     collection_id: Optional[str] = None
     include_pdf_results: bool = True
     include_db_results: bool = True
+    include_chat_results: bool = True  # NEW: Search in chat logs?
     # collection_id: Optional[str] = None  # Optional: search specific PDF collection
     # include_pdf_results: bool = True     # Search in PDFs? 
     # include_db_results: bool = True      # Search in database?
@@ -72,6 +81,7 @@ class HybridResponse(BaseModel):
     answer: str
     pdf_sources: List[str]
     db_results: Dict[str, Any]
+    chat_results: Optional[List[Dict[str, Any]]] = None  # NEW: Chat search results
     processing_time: float
     search_terms: List[str]
     target_tables: Optional[List[str]] = None  # Tables that were searched (smart routing)
@@ -115,3 +125,46 @@ class TableRelationship(BaseModel):
     table2: str
     join_condition: str
     relationship_type: str 
+
+
+# ===================== CHAT MODELS =====================
+
+class ChatMessage(BaseModel):
+    """Single chat message parsed from export file"""
+    message_id: Optional[str] = None
+    sender: str
+    timestamp: datetime
+    content: str
+    platform: ChatPlatform = ChatPlatform.WHATSAPP
+    thread_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    raw_line: Optional[str] = None  # Original line for debugging
+
+
+class ChatCollection(BaseModel):
+    """Metadata for an uploaded chat collection"""
+    collection_id: str
+    platform: ChatPlatform
+    file_name: str
+    message_count: int
+    date_range: Optional[Dict[str, str]] = None  # {"start": ..., "end": ...}
+    participants: List[str]
+    created_at: datetime
+
+
+class ChatUploadResponse(BaseModel):
+    """Response after uploading chat file"""
+    collection_id: str
+    file_name: str
+    platform: str
+    message_count: int
+    participants: List[str]
+    date_range: Optional[Dict[str, str]] = None
+    status: str
+
+
+class ChatSearchResult(BaseModel):
+    """Single result from chat search"""
+    message: ChatMessage
+    relevance_score: float
+    context_messages: Optional[List[ChatMessage]] = None  # Surrounding messages for context

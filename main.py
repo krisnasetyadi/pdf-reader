@@ -31,6 +31,8 @@ app.add_middleware(
 # Create necessary directories
 os.makedirs(config.upload_folder, exist_ok=True)
 os.makedirs(config.index_folder, exist_ok=True)
+os.makedirs(config.chat_upload_folder, exist_ok=True)
+os.makedirs(config.chat_index_folder, exist_ok=True)
 
 
 @app.on_event("startup")
@@ -50,7 +52,8 @@ async def health_check():
         "status": "healthy",
         "initialized": hasattr(processor, '_initialized')
         and processor._initialized,
-        "collections_count": len(processor.get_all_collections())
+        "pdf_collections_count": len(processor.get_all_collections()),
+        "chat_collections_count": len(processor.get_all_chat_collections())
     }
 
 # Include routers
@@ -61,6 +64,7 @@ from router.collections import router as collections_router
 from router.hybrid import router as hybrid_router
 from router.structured import router as structured_router
 from router.join import router as join_router
+from router.chat import router as chat_router  
 
 app.include_router(upload_router, prefix="/api/v1")
 app.include_router(query_router, prefix="/api/v1")
@@ -68,6 +72,7 @@ app.include_router(collections_router, prefix="/api/v1")
 app.include_router(hybrid_router, prefix="/api/v1")
 app.include_router(structured_router, prefix="/api/v1")
 app.include_router(join_router, prefix="/api/v1")
+app.include_router(chat_router, prefix="/api/v1")  
     
 # except ImportError as e:
 #     logger.warning(

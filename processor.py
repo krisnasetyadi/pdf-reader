@@ -305,7 +305,7 @@ JAWABAN:"""
             return "Maaf, terjadi kesalahan dalam menghasilkan jawaban."
 
     def get_all_collections(self):
-        """Return list of available collections"""
+        """Return list of available PDF collections"""
         collections = []
         if not os.path.exists(config.index_folder):
             return collections
@@ -317,12 +317,101 @@ JAWABAN:"""
                 collections.append(entry)
         return collections
 
+    def get_all_chat_collections(self):
+        """Return list of available chat collections"""
+        collections = []
+        if not os.path.exists(config.chat_index_folder):
+            return collections
+
+        for entry in os.listdir(config.chat_index_folder):
+            entry_path = os.path.join(config.chat_index_folder, entry)
+            if (os.path.isdir(entry_path) and
+                    os.path.exists(os.path.join(entry_path, "index.faiss"))):
+                collections.append(entry)
+        return collections
+
+    def get_chat_vector_store(self, collection_id: str):
+        """Get or load chat vector store from cache"""
+        cache_key = f"chat_{collection_id}"
+        
+        with self._cache_lock:
+            if cache_key in self.vector_store_cache:
+                return self.vector_store_cache[cache_key]
+        
+        index_path = os.path.join(config.chat_index_folder, collection_id)
+        if not os.path.exists(index_path):
+            logger.warning(f"Chat index not found: {index_path}")
+            return None
+        
+        try:
+            from langchain_community.vectorstores import FAISS
+            vector_store = FAISS.load_local(
+                index_path,
+                self.embeddings,
+                allow_dangerous_deserialization=True
+            )
+            
+            with self._cache_lock:
+                self.vector_store_cache[cache_key] = vector_store
+            
+            logger.info(f"📱 Loaded chat vector store: {collection_id}")
+            return vector_store
+        except Exception as e:
+            logger.error(f"Failed to load chat vector store {collection_id}: {e}")
+            return None
+
+    def search_across_chat_collections(
+        self, 
+        question: str, 
+        collection_ids: Optional[List[str]] = None,
+        top_k: int = 3
+    ) -> List:
+        """Search across chat collections"""
+        if collection_ids is None:
+            collection_ids = self.get_all_chat_collections()
+        
+        if not collection_ids:
+            logger.info("No chat collections available")
+            return []
+        
+        all_results = []
+        
+        for collection_id in collection_ids:
+            vector_store = self.get_chat_vector_store(collection_id)
+            if not vector_store:
+                continue
+            
+            try:
+                results = vector_store.similarity_search_with_relevance_scores(
+                    question, k=top_k
+                )
+                
+                for doc, score in results:
+                    # Only include results above threshold
+                    if score >= 0.3:  # Lower threshold for chat since context is important
+                        doc.metadata['similarity_score'] = float(score)
+                        doc.metadata['collection_id'] = collection_id
+                        all_results.append(doc)
+                        
+            except Exception as e:
+                logger.error(f"Error searching chat collection {collection_id}: {e}")
+                continue
+        
+        # Sort by score and return top results
+        all_results.sort(key=lambda x: x.metadata.get('similarity_score', 0), reverse=True)
+        logger.info(f"📱 Found {len(all_results)} chat results")
+        return all_results[:top_k * 2]  # Return more context for chats
+
     def invalidate_cache(self, collection_id=None):
         """Invalidate cache for specific collection or all"""
         with self._cache_lock:
             if collection_id:
                 if collection_id in self.vector_store_cache:
                     del self.vector_store_cache[collection_id]
+                # Also check chat cache
+                chat_key = f"chat_{collection_id}"
+                if chat_key in self.vector_store_cache:
+                    del self.vector_store_cache[chat_key]
             else:
                 self.vector_store_cache.clear()
 
@@ -642,8 +731,13 @@ JAWABAN:"""
         
         return word
 
-    def hybrid_search(self, question: str, collection_ids: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Perform hybrid search across both structured and unstructured data"""
+    def hybrid_search(
+        self, 
+        question: str, 
+        collection_ids: Optional[List[str]] = None,
+        include_chat: bool = True
+    ) -> Dict[str, Any]:
+        """Perform hybrid search across PDF, database, and chat data"""
 
         analysis = self.analyze_question_type(question)
         search_terms = analysis["search_terms"]
@@ -662,9 +756,18 @@ JAWABAN:"""
             # Pass target_tables for smart routing
             db_results = self.query_structured_data(search_terms, target_tables)
 
+        # NEW: Search chat collections
+        chat_docs = []
+        if include_chat:
+            chat_docs = self.search_across_chat_collections(
+                question,
+                top_k=config.k_per_collection
+            )
+
         return {
             "pdf_documents": pdf_docs,
             "database_results": db_results,
+            "chat_documents": chat_docs,  # NEW
             "search_analysis": analysis,
             "search_terms": search_terms,
             "target_tables": target_tables  # Include for debugging/transparency
@@ -675,14 +778,16 @@ JAWABAN:"""
         pdf_docs = hybrid_results['pdf_documents']
         db_results = hybrid_results['database_results']
         target_tables = hybrid_results.get('target_tables', [])
+        chat_docs = hybrid_results.get('chat_documents', [])  # NEW
 
         has_pdf_results = len(pdf_docs) > 0
         has_db_results = len(db_results) > 0
+        has_chat_results = len(chat_docs) > 0  # NEW
         
-        if not has_pdf_results and not has_db_results:
-            return "Maaf, tidak ditemukan informasi yang relevan baik dalam dokumen maupun database."
+        if not has_pdf_results and not has_db_results and not has_chat_results:
+            return "Maaf, tidak ditemukan informasi yang relevan dalam dokumen, database, maupun chat logs."
 
-        # Prepare context from both sources
+        # Prepare context from all sources
         context_parts = []
 
         # Add PDF context with confidence scores
@@ -721,12 +826,28 @@ JAWABAN:"""
                     if db_result.record_count > 3:
                         context_parts.append(f" - ... dan {db_result.record_count - 3} record lainnya")
 
+   
+        if has_chat_results:
+            context_parts.append("\nINFORMASI DARI CHAT LOGS:")
+            for i, doc in enumerate(chat_docs[:3]):  # limit to top 3 chat results
+                source = doc.metadata.get('source', 'Unknown')
+                platform = doc.metadata.get('platform', 'unknown')
+                participants = doc.metadata.get('participants', '')
+                score = doc.metadata.get('similarity_score', 0)
+                time_start = doc.metadata.get('time_range_start', '')
+                
+                truncated_content = self.truncate_context(doc.page_content, max_tokens=200)
+                context_parts.append(f"[Chat: {source}, Platform: {platform}, Relevansi: {score:.2f}]")
+                if participants:
+                    context_parts.append(f"Peserta: {participants}")
+                context_parts.append(f"{truncated_content}\n")
+
         context = "\n".join(context_parts)
-        context = self.truncate_context(context, max_tokens=500)
+        context = self.truncate_context(context, max_tokens=600)  # Increased for 3 sources
 
         # Enhanced prompt for hybrid answers
-        prompt_template = """Berdasarkan informasi dari dokumen dan database berikut, jawab pertanyaan dengan jelas dan akurat. 
-Sertakan informasi dari kedua sumber jika relevan. Prioritaskan informasi dengan skor relevansi tinggi.
+        prompt_template = """Berdasarkan informasi dari dokumen, database, dan chat logs berikut, jawab pertanyaan dengan jelas dan akurat. 
+Sertakan informasi dari semua sumber yang relevan. Prioritaskan informasi dengan skor relevansi tinggi.
 
 {context}
 

@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 @router.post('/query/hybrid', response_model=HybridResponse)
 async def hybrid_query(request: HybridQueryRequest):
-    """Hybrid query across both structured and unstructured data"""
+    """Hybrid query across PDF documents, database, and chat logs"""
     start_time = datetime.now()
 
     logger.info(f"🔍 Hybrid query received: {request.question}")
@@ -26,28 +26,30 @@ async def hybrid_query(request: HybridQueryRequest):
                 detail="Pertanyaan terlalu pendek atau kosong"
             )
 
-        # Determine collections to search - FLEXIBLE LOGIC
+        # Determine PDF collections to search
         if request.collection_id:
-            # User specified a particular collection
             collection_ids = [request.collection_id]
             logger.info(f"Searching in specific collection: {request.collection_id}")
         else:
-            # Search across ALL available collections
             collection_ids = processor.get_all_collections()
             if collection_ids:
-                logger.info(f"Searching across {len(collection_ids)} collections: {collection_ids}")
+                logger.info(f"Searching across {len(collection_ids)} PDF collections")
             else:
-                logger.info("No PDF collections available, will search database only")
+                logger.info("No PDF collections available")
 
-        # Check if we should search PDFs
+        # Check what to search
         should_search_pdfs = request.include_pdf_results and collection_ids
         should_search_db = request.include_db_results
+        should_search_chat = request.include_chat_results
 
-        logger.info(f"PDF search: {should_search_pdfs}, DB search: {should_search_db}")
+        logger.info(f"PDF: {should_search_pdfs}, DB: {should_search_db}, Chat: {should_search_chat}")
 
-        # Perform hybrid search
+        # Perform hybrid search (now includes chat)
         hybrid_results = await asyncio.to_thread(
-            processor.hybrid_search, request.question, collection_ids
+            processor.hybrid_search, 
+            request.question, 
+            collection_ids,
+            should_search_chat  # Pass include_chat flag
         )
 
         # Generate answer
@@ -61,21 +63,33 @@ async def hybrid_query(request: HybridQueryRequest):
         # Extract PDF sources
         pdf_sources = []
         pdf_docs = hybrid_results.get('pdf_documents', [])
-        
         for doc in pdf_docs:
             source_info = f"{doc.metadata.get('source', 'Unknown')}"
             if 'page' in doc.metadata:
                 source_info += f" (Halaman {doc.metadata['page']})"
             pdf_sources.append(source_info)
 
+        # Extract chat results
+        chat_results = []
+        chat_docs = hybrid_results.get('chat_documents', [])
+        for doc in chat_docs:
+            chat_results.append({
+                "source": doc.metadata.get('source', 'Unknown'),
+                "platform": doc.metadata.get('platform', 'unknown'),
+                "participants": doc.metadata.get('participants', ''),
+                "relevance_score": doc.metadata.get('similarity_score', 0),
+                "content_preview": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
+            })
+
         # Log search results
         target_tables = hybrid_results.get('target_tables', [])
-        logger.info(f"✅ Search completed - PDFs: {len(pdf_sources)}, DB tables: {len(hybrid_results.get('database_results', {}))}, Target tables: {target_tables}")
+        logger.info(f"✅ Search completed - PDFs: {len(pdf_sources)}, DB: {len(hybrid_results.get('database_results', {}))}, Chats: {len(chat_results)}")
 
         return HybridResponse(
             answer=answer,
             pdf_sources=pdf_sources,
             db_results=hybrid_results.get('database_results', {}),
+            chat_results=chat_results if chat_results else None,
             processing_time=processing_time,
             search_terms=hybrid_results.get('search_terms', []),
             target_tables=target_tables
