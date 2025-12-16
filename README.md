@@ -1,4 +1,4 @@
-# 📄 PDF QA Assistant
+# 📄 PDF QA Assistant / DocuLens (Document Lens)
 
 An intelligent document question-answering system that combines **PDF documents**, **Database**, and **Chat Logs** search with AI-powered responses. Built with FastAPI, LangChain, FAISS, and multiple LLM providers (HuggingFace, Ollama, Gemini).
 
