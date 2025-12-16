@@ -6,8 +6,7 @@ from transformers import (
     GenerationConfig
 )
 import logging
-from langchain_community.llms import HuggingFacePipeline
-from langchain_community.embeddings.huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFacePipeline, HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 import threading
 import torch

@@ -1,46 +1,69 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, field_validator
 from typing import List
+
+
+# Whitelist of allowed table names (security: prevents SQL injection)
+ALLOWED_TABLES = frozenset(["user_profiles", "products", "orders"])
 
 
 class Config(BaseSettings):
     # Model settings
-    model_name: str = Field(default="google/flan-t5-base")
-    embedding_model: str = Field(default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-    max_new_tokens: int = Field(default=256)
-    temperature: float = Field(default=0.3)
+    model_name: str = Field(...)
+    embedding_model: str = Field(...)
+    max_new_tokens: int = Field(...)
+    temperature: float = Field(...)
 
     # File Paths - PDF
-    upload_folder: str = Field(default="data/uploads")
-    index_folder: str = Field(default="data/indices")
+    upload_folder: str = Field(...)
+    index_folder: str = Field(...)
     
     # File Paths - Chat Logs
-    chat_upload_folder: str = Field(default="data/chat_uploads")
-    chat_index_folder: str = Field(default="data/chat_indices")
+    chat_upload_folder: str = Field(...)
+    chat_index_folder: str = Field(...)
 
     # Retrieval Parameters
-    chunk_size: int = Field(default=600)
-    chunk_overlap: int = Field(default=100)
-    k_results: int = Field(default=5)
-    k_per_collection: int = Field(default=3)
-    total_k_results: int = Field(default=8)
+    chunk_size: int = Field(...)
+    chunk_overlap: int = Field(...)
+    k_results: int = Field(...)
+    k_per_collection: int = Field(...)
+    total_k_results: int = Field(...)
     
     # Chat-specific retrieval
-    chat_chunk_size: int = Field(default=10)  # Messages per chunk
-    chat_chunk_overlap: int = Field(default=2)  # Overlapping messages
+    chat_chunk_size: int = Field(...)
+    chat_chunk_overlap: int = Field(...)
 
     # Database Configuration
-    db_host: str = Field(default="localhost")
-    db_port: int = Field(default=5432)
-    db_name: str = Field(default="qa_system")
-    db_user: str = Field(default="postgres")
-    db_password: str = Field(default="qwerty123")
+    db_host: str = Field(...)
+    db_port: int = Field(...)
+    db_name: str = Field(...)
+    db_user: str = Field(...)
+    db_password: str = Field(...)
     db_tables: List[str] = Field(default=["user_profiles", "products", "orders"])
     
+    @field_validator('db_tables')
+    @classmethod
+    def validate_tables(cls, v):
+        """Ensure only whitelisted tables are configured"""
+        invalid_tables = set(v) - ALLOWED_TABLES
+        if invalid_tables:
+            raise ValueError(f"Invalid table names: {invalid_tables}. Allowed: {ALLOWED_TABLES}")
+        return v
+    
+    # CORS Configuration
+    cors_origins: str = Field(...)
+    
+    @property
+    def cors_origin_list(self) -> List[str]:
+        """Parse CORS origins from comma-separated string"""
+        if self.cors_origins == "*":
+            return ["*"]
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+    
     # Hybrid Search
-    enable_hybrid_search: bool = Field(default=True)
-    db_result_limit: int = Field(default=5)
-    min_similarity_score: float = Field(default=0.75)
+    enable_hybrid_search: bool = Field(...)
+    db_result_limit: int = Field(...)
+    min_similarity_score: float = Field(...)
     
     # Supported chat platforms
     supported_chat_platforms: List[str] = Field(default=["whatsapp"])

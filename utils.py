@@ -2,9 +2,9 @@ import pdfplumber
 import os
 import logging
 import re
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS # type: ignore
-from langchain.schema import Document
+from langchain_core.documents import Document
 from config import config
 
 logger = logging.getLogger(__name__)

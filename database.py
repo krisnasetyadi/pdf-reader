@@ -1,12 +1,20 @@
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import logging
-from config import Config
+from config import Config, ALLOWED_TABLES
 from typing import List, Dict, Any, Optional, Tuple
 import os
 import re
 
 logger = logging.getLogger(__name__)
+
+
+def validate_table_name(table_name: str) -> str:
+    """Validate table name against whitelist to prevent SQL injection"""
+    if table_name not in ALLOWED_TABLES:
+        raise ValueError(f"Invalid table name: {table_name}. Allowed: {ALLOWED_TABLES}")
+    return table_name
+
 
 class DatabaseManager:
     def __init__(self):
@@ -293,6 +301,9 @@ class DatabaseManager:
     def search_with_fts(self, table_name: str, search_terms: List[str], limit: int = 10, phrases: List[str] = None) -> List[Dict[str, Any]]:
         """Full-Text Search with ts_rank scoring - prioritizes phrase matches"""
         try:
+            # Validate table name against whitelist
+            table_name = validate_table_name(table_name)
+            
             # Check if table has search_vector column
             schema = self.get_table_schema(table_name)
             has_fts = any(col['column_name'] == 'search_vector' for col in schema)
@@ -384,6 +395,9 @@ class DatabaseManager:
     def search_with_ilike(self, table_name: str, search_terms: List[str], limit: int = 10, phrases: List[str] = None) -> List[Dict[str, Any]]:
         """Fallback ILIKE search with basic scoring - case insensitive, prioritizes phrase matches"""
         try:
+            # Validate table name against whitelist
+            table_name = validate_table_name(table_name)
+            
             schema = self.get_table_schema(table_name)
             text_columns = [col['column_name'] for col in schema 
                         if col['data_type'] in ['text', 'character varying', 'varchar']
@@ -465,9 +479,11 @@ class DatabaseManager:
         
         return word  
       
-    def get_table_sample(self, table_name: str,limit: int = 5) -> List[Dict[str, Any]]:
+    def get_table_sample(self, table_name: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Get sample rows from a table"""
         try:
+            # Validate table name against whitelist
+            table_name = validate_table_name(table_name)
             query = f"SELECT * FROM {table_name} LIMIT %s"
             return self.execute_query(query, (limit,))
         except Exception as e:
