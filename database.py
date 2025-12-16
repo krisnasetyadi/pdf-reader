@@ -23,17 +23,21 @@ class DatabaseManager:
         self.initialize_dummy_data()
 
     def connect(self):
-        "Establish database connection"
+        "Establish database connection using db_config property"
         try:
+            config = Config()
+            db_config = config.db_config
+            
             self.connection = psycopg2.connect(
-                host=Config().db_host,
-                port=Config().db_port,
-                database=Config().db_name,
-                user=Config().db_user,
-                password=Config().db_password,
+                host=db_config["host"],
+                port=db_config["port"],
+                database=db_config["database"],
+                user=db_config["user"],
+                password=db_config["password"],
+                sslmode=db_config.get("sslmode", "prefer"),
                 cursor_factory=RealDictCursor
             )
-            logger.info("Database connection established")
+            logger.info(f"Database connection established to {db_config['host']}")
         except Exception as e:
             logger.error(f"Failed to connect to database: {e}")
             raise

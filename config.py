@@ -2,10 +2,27 @@ from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from typing import List, Optional
 from enum import Enum
+from urllib.parse import urlparse
+import os
 
 
 # Whitelist of allowed table names (security: prevents SQL injection)
 ALLOWED_TABLES = frozenset(["user_profiles", "products", "orders"])
+
+
+def parse_database_url(url: str) -> dict:
+    """
+    Parse DATABASE_URL connection string (untuk Neon, Supabase, dll)
+    Format: postgresql://user:password@host:port/database?sslmode=require
+    """
+    parsed = urlparse(url)
+    return {
+        "host": parsed.hostname or "localhost",
+        "port": parsed.port or 5432,
+        "database": parsed.path.lstrip("/") if parsed.path else "postgres",
+        "user": parsed.username or "postgres",
+        "password": parsed.password or "",
+    }
 
 
 class LLMProvider(str, Enum):
@@ -75,12 +92,35 @@ class Config(BaseSettings):
     chat_chunk_overlap: int = Field(...)
 
     # Database Configuration
-    db_host: str = Field(...)
-    db_port: int = Field(...)
-    db_name: str = Field(...)
-    db_user: str = Field(...)
-    db_password: str = Field(...)
+    # Option 1: Use DATABASE_URL (recommended for cloud: Neon, Supabase)
+    database_url: Optional[str] = Field(default=None)
+    
+    # Option 2: Individual settings (fallback if DATABASE_URL not set)
+    db_host: str = Field(default="localhost")
+    db_port: int = Field(default=5432)
+    db_name: str = Field(default="postgres")
+    db_user: str = Field(default="postgres")
+    db_password: str = Field(default="")
     db_tables: List[str] = Field(default=["user_profiles", "products", "orders"])
+    
+    # SSL mode for database (required for Neon)
+    db_sslmode: str = Field(default="prefer")
+    
+    @property
+    def db_config(self) -> dict:
+        """Get database config - parse DATABASE_URL if available, else use individual settings"""
+        if self.database_url:
+            config = parse_database_url(self.database_url)
+            config["sslmode"] = "require"  # Cloud DBs require SSL
+            return config
+        return {
+            "host": self.db_host,
+            "port": self.db_port,
+            "database": self.db_name,
+            "user": self.db_user,
+            "password": self.db_password,
+            "sslmode": self.db_sslmode,
+        }
     
     @field_validator('db_tables')
     @classmethod

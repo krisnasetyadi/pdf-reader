@@ -1,0 +1,63 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+source/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local development
+.env
+.env.local
+*.log
+
+# Data (will be created at runtime)
+data/uploads/*
+data/indices/*
+!data/uploads/.gitkeep
+!data/indices/.gitkeep
+
+# Test files
+test.txt
+*.test.py
+tests/
+
+# Documentation
+*.md
+!README.md
+
+# Backups
+*-backup
+*.backup
