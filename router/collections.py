@@ -22,6 +22,12 @@ async def list_collections():
     """List available document collections"""
     try:
         collections = []
+        
+        # Check if index folder exists
+        if not os.path.exists(config.index_folder):
+            logger.warning(f"Index folder not found: {config.index_folder}")
+            return collections
+            
         for entry in os.listdir(config.index_folder):
             entry_path = os.path.join(config.index_folder, entry)
             if os.path.isdir(entry_path):
@@ -30,28 +36,35 @@ async def list_collections():
                     index_mtime = os.path.getmtime(index_file)
                     created_at = datetime.fromtimestamp(index_mtime)
                     
-                    # Count documents in collection
+                    # Get file names from uploads folder
+                    upload_path = os.path.join(config.upload_folder, entry)
+                    file_names = []
+                    if os.path.exists(upload_path):
+                        file_names = [f for f in os.listdir(upload_path) if f.endswith('.pdf')]
+                    
+                    # Try to get more info from vector store, but don't fail if it doesn't work
+                    source_files = set()
                     try:
                         vector_store = processor.get_vector_store(entry)
-                        if vector_store:
-                            # Get unique source files
-                            source_files = set()
-                            if hasattr(vector_store, 'docstore'):
-                                for doc_id in vector_store.docstore._dict:
-                                    doc = vector_store.docstore._dict[doc_id]
-                                    if hasattr(doc, 'metadata') and 'source' in doc.metadata:
-                                        source_files.add(doc.metadata['source'])
-                            
-                            collections.append(CollectionInfo(
-                                collection_id=entry,
-                                document_count=len(source_files),
-                                created_at=created_at.isoformat(),
-                                file_names=list(source_files)
-                            ))
+                        if vector_store and hasattr(vector_store, 'docstore'):
+                            for doc_id in vector_store.docstore._dict:
+                                doc = vector_store.docstore._dict[doc_id]
+                                if hasattr(doc, 'metadata') and 'source' in doc.metadata:
+                                    source_files.add(os.path.basename(doc.metadata['source']))
                     except Exception as e:
-                        logger.warning(f"Skipping collection {entry}: {str(e)}")
-                        continue
+                        logger.warning(f"Could not load vector store for {entry}: {str(e)}")
+                    
+                    # Use file_names from uploads if source_files is empty
+                    final_file_names = list(source_files) if source_files else file_names
+                    
+                    collections.append(CollectionInfo(
+                        collection_id=entry,
+                        document_count=len(final_file_names) if final_file_names else 1,
+                        created_at=created_at.isoformat(),
+                        file_names=final_file_names
+                    ))
         
+        logger.info(f"Found {len(collections)} collections")
         return collections
     
     except Exception as e:
