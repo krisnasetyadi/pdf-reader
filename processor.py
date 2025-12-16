@@ -1,4 +1,4 @@
-from config import config
+from config import config, LLMProvider, AVAILABLE_MODELS
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -11,7 +11,7 @@ from langchain_community.vectorstores import FAISS
 import threading
 import torch
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from models import SearchType, DatabaseResult, SourceInfo
 from database import db_manager
 
@@ -28,6 +28,11 @@ class PDFQAProcessor:
         self._initialized = False
         self._init_lock = threading.Lock()
         self.db_manager = None
+        
+        # Multi-LLM support
+        self._llm_cache = {}  # Cache for loaded LLMs: {provider_model: llm_instance}
+        self._current_provider = None
+        self._current_model = None
         self._db_initialized = False
 
         self.query_expansion_terms = {
@@ -189,8 +194,39 @@ class PDFQAProcessor:
         sorted_results = sorted(unique_results.values(), key=lambda x: x[1], reverse=True)
         return [doc for doc, score in sorted_results[:config.total_k_results]]
 
+    def clean_context(self, text: str) -> str:
+        """Clean context text to remove noise that confuses the LLM"""
+        import re
+        
+        # Remove excessive whitespace and normalize
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove diagram/flowchart artifacts (arrows, boxes)
+        text = re.sub(r'[→←↑↓►◄▲▼■□●○◆◇]', '', text)
+        text = re.sub(r'[\|│┃┆┊╎]', ' ', text)  # vertical lines
+        text = re.sub(r'[-─━]{3,}', ' ', text)  # horizontal lines
+        
+        # Remove repeated single characters that appear in diagrams
+        text = re.sub(r'(\b\w\b\s*){4,}', '', text)
+        
+        # Remove common PDF artifacts
+        text = re.sub(r'Page \d+ of \d+', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\[\d+\]', '', text)  # footnote markers
+        
+        # Remove text that looks like reversed/garbled (consecutive uppercase without spaces)
+        # Keep meaningful acronyms (2-6 chars) but remove long garbled strings
+        text = re.sub(r'\b[A-Z]{7,}\b', '', text)
+        
+        # Clean up multiple spaces again after removals
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+
     def truncate_context(self, text, max_tokens=500):
         """Truncate context to avoid token limit issues"""
+        # Clean the text first
+        text = self.clean_context(text)
+        
         # Simple word-based truncation
         words = text.split()
         if len(words) > max_tokens:
@@ -212,34 +248,44 @@ class PDFQAProcessor:
             score = doc.metadata.get('similarity_score', 0)
 
             # Truncate each document content to avoid token limit
-            truncated_content = self.truncate_context(doc.page_content, max_tokens=200)
+            truncated_content = self.truncate_context(doc.page_content, max_tokens=150)
 
             context_parts.append(
-                f"[Source: {source}, Page: {page}, Confidence: {score:.2f}]\n"
-                f"{truncated_content}\n"
+                f"[Source: {source}, Page: {page}]\n{truncated_content}\n"
             )
 
         context = "\n".join(context_parts)
 
         # Further truncate the entire context if needed
-        context = self.truncate_context(context, max_tokens=500)
+        context = self.truncate_context(context, max_tokens=400)
 
-        # Simplified prompt template to avoid instruction confusion
-        prompt_template = """Berdasarkan informasi dari dokumen berikut, jawab pertanyaan dengan jelas dan akurat.
+        # Simplified prompt for flan-t5
+        prompt_template = """Answer the question based on the context. Answer in Indonesian.
 
-INFORMASI DOKUMEN:
+Context:
 {context}
 
-PERTANYAAN: {question}
+Question: {question}
 
-JAWABAN:"""
+Answer:"""
 
         prompt = prompt_template.format(context=context, question=question)
 
         try:
-            # Use invoke() instead of __call__() to avoid deprecation warning
             result = self.llm.invoke(prompt)
-            return result.strip()
+            answer = result.strip()
+            
+            # Validate output
+            if self._is_garbled_output(answer):
+                logger.warning(f"Garbled output in generate_answer: {answer[:100]}")
+                # Return best document content as fallback
+                best_doc = context_docs[0]
+                source = best_doc.metadata.get('source', 'dokumen')
+                page = best_doc.metadata.get('page', '?')
+                content = self.truncate_context(best_doc.page_content, max_tokens=150)
+                return f"Berdasarkan {source} (halaman {page}):\n\n{content}"
+            
+            return answer
         except Exception as e:
             logger.error(f"LLM generation failed: {str(e)}")
             return "Maaf, terjadi kesalahan dalam menghasilkan jawaban."
@@ -365,6 +411,152 @@ JAWABAN:"""
             logger.error(f"Failed to initialize database: {e}")
             self._db_initialized = False
 
+    def get_llm(self, provider: Optional[str] = None, model: Optional[str] = None) -> Tuple[Any, str]:
+        """
+        Get LLM instance based on provider and model.
+        Returns (llm_instance, model_identifier_string)
+        
+        If provider/model not specified, uses config defaults.
+        Caches LLM instances for reuse.
+        """
+        # Determine provider
+        if provider:
+            try:
+                llm_provider = LLMProvider(provider.lower())
+            except ValueError:
+                logger.warning(f"Invalid provider '{provider}', using default")
+                llm_provider = config.llm_provider
+        else:
+            llm_provider = config.llm_provider
+        
+        # Determine model based on provider
+        if model:
+            llm_model = model
+        else:
+            if llm_provider == LLMProvider.HUGGINGFACE:
+                llm_model = config.model_name
+            elif llm_provider == LLMProvider.OLLAMA:
+                llm_model = config.ollama_model
+            elif llm_provider == LLMProvider.GEMINI:
+                llm_model = config.gemini_model
+            else:
+                llm_model = config.model_name
+        
+        # Create cache key
+        cache_key = f"{llm_provider.value}:{llm_model}"
+        model_identifier = f"{llm_provider.value}/{llm_model}"
+        
+        # Check cache
+        if cache_key in self._llm_cache:
+            logger.info(f"🔄 Using cached LLM: {model_identifier}")
+            return self._llm_cache[cache_key], model_identifier
+        
+        # Load new LLM
+        logger.info(f"🚀 Loading LLM: {model_identifier}")
+        
+        try:
+            if llm_provider == LLMProvider.HUGGINGFACE:
+                llm = self._load_huggingface_llm(llm_model)
+            elif llm_provider == LLMProvider.OLLAMA:
+                llm = self._load_ollama_llm(llm_model)
+            elif llm_provider == LLMProvider.GEMINI:
+                llm = self._load_gemini_llm(llm_model)
+            else:
+                raise ValueError(f"Unsupported provider: {llm_provider}")
+            
+            # Cache the LLM
+            self._llm_cache[cache_key] = llm
+            self._current_provider = llm_provider
+            self._current_model = llm_model
+            
+            logger.info(f"✅ LLM loaded successfully: {model_identifier}")
+            return llm, model_identifier
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load {model_identifier}: {e}")
+            # Fallback to default HuggingFace
+            if llm_provider != LLMProvider.HUGGINGFACE:
+                logger.info("⚠️ Falling back to HuggingFace default")
+                return self.get_llm(LLMProvider.HUGGINGFACE.value, "google/flan-t5-base")
+            raise
+    
+    def _load_huggingface_llm(self, model_name: str):
+        """Load HuggingFace model (local)"""
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+        except Exception:
+            logger.warning(f"Model {model_name} failed, using fallback")
+            model_name = "google/flan-t5-small"
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            low_cpu_mem_usage=True
+        )
+        
+        generation_config = GenerationConfig(
+            max_new_tokens=config.max_new_tokens,
+            temperature=config.temperature,
+            do_sample=True,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.pad_token_id
+        )
+        
+        pipe = pipeline(
+            "text2text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            generation_config=generation_config,
+            batch_size=4 if torch.cuda.is_available() else 1
+        )
+        
+        return HuggingFacePipeline(pipeline=pipe)
+    
+    def _load_ollama_llm(self, model_name: str):
+        """Load Ollama model (local)"""
+        try:
+            from langchain_ollama import ChatOllama
+        except ImportError:
+            raise ImportError("Install langchain-ollama: pip install langchain-ollama")
+        
+        return ChatOllama(
+            model=model_name,
+            base_url=config.ollama_base_url,
+            temperature=config.temperature,
+        )
+    
+    def _load_gemini_llm(self, model_name: str):
+        """Load Google Gemini model (cloud - free tier)"""
+        if not config.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY not set in .env")
+        
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+        except ImportError:
+            raise ImportError("Install langchain-google-genai: pip install langchain-google-genai")
+        
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=config.gemini_api_key,
+            temperature=config.temperature,
+        )
+    
+    def get_available_models(self) -> Dict[str, List[str]]:
+        """Return available models per provider"""
+        return {provider.value: models for provider, models in AVAILABLE_MODELS.items()}
+    
+    def get_current_model_info(self) -> str:
+        """Get current model identifier string"""
+        if self._current_provider and self._current_model:
+            return f"{self._current_provider.value}/{self._current_model}"
+        return f"{config.llm_provider.value}/{config.model_name}"
+
     def initialize_components(self):
         """Initialize all components including database"""
         with self._init_lock:
@@ -383,58 +575,24 @@ JAWABAN:"""
                     encode_kwargs={'normalize_embeddings': True}
                 )
 
-                try:
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        config.model_name)
-                except Exception as e:
-                    logger.warning(f"Primary model {config.model_name} failed, using fallback: google/flan-t5-small")
-                    config.model_name = "google/flan-t5-small"  # Fallback ke model yang lebih kecil
-                    self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-
-                if self.tokenizer.pad_token is None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-
-                try:
-                    model = AutoModelForSeq2SeqLM.from_pretrained(
-                        config.model_name,
-                        device_map="auto",
-                        torch_dtype=torch.float16 if torch.cuda.is_available()
-                        else torch.float32,
-                        low_cpu_mem_usage=True
-                    )
-                except Exception as e:
-                    logger.warning(f"Primary model {config.model_name} failed, using fallback: google/flan-t5-small")
-                    config.model_name = "google/flan-t5-small"
-                    model = AutoModelForSeq2SeqLM.from_pretrained(
-                        config.model_name,
-                        device_map="auto",
-                        torch_dtype=torch.float16 if torch.cuda.is_available()
-                        else torch.float32,
-                        low_cpu_mem_usage=True
-                    )
-                generation_config = GenerationConfig(
-                    max_new_tokens = config.max_new_tokens,
-                    temperature = config.temperature,
-                    do_sample = True,
-                    top_p = 0.9,
-                    repetition_penalty = 1.1,
-                    pad_token_id = self.tokenizer.pad_token_id
-                )
-
-                pipe = pipeline(
-                    "text2text-generation",
-                    model=model,
-                    tokenizer=self.tokenizer,
-                    generation_config=generation_config,
-                    batch_size=4 if torch.cuda.is_available() else 1
-                )
-
-                self.llm = HuggingFacePipeline(pipeline=pipe)
+                # Load default LLM
+                self.llm, model_id = self.get_llm()
+                
+                # Keep tokenizer reference for HuggingFace models
+                if config.llm_provider == LLMProvider.HUGGINGFACE:
+                    try:
+                        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+                    except:
+                        self.tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-small")
 
                 self.initialize_database()
             
                 self._initialized = True
-                logger.info(f"All components initialized successfully with model: {config.model_name}")
+                logger.info(f"✅ All components initialized with model: {model_id}")
+
+            except Exception as e:
+                logger.error(f"Failed to initialize components: {str(e)}")
+                raise
 
             except Exception as e:
                 logger.error(f"Failed to initialize components: {str(e)}")
@@ -711,8 +869,21 @@ JAWABAN:"""
             "target_tables": target_tables  # Include for debugging/transparency
         }
 
-    def generate_hybrid_answer(self, hybrid_results: Dict[str, Any], question: str) -> str:
-        """Generate answer combining both structured and unstructured data with relevance scoring"""
+    def generate_hybrid_answer(
+        self, 
+        hybrid_results: Dict[str, Any], 
+        question: str,
+        llm_provider: Optional[str] = None,
+        llm_model: Optional[str] = None
+    ) -> Tuple[str, str]:
+        """
+        Generate answer combining both structured and unstructured data with relevance scoring.
+        
+        Returns: (answer_text, model_identifier)
+        """
+        # Get LLM based on request parameters or defaults
+        llm, model_id = self.get_llm(llm_provider, llm_model)
+        
         pdf_docs = hybrid_results['pdf_documents']
         db_results = hybrid_results['database_results']
         target_tables = hybrid_results.get('target_tables', [])
@@ -723,7 +894,7 @@ JAWABAN:"""
         has_chat_results = len(chat_docs) > 0  # NEW
         
         if not has_pdf_results and not has_db_results and not has_chat_results:
-            return "Maaf, tidak ditemukan informasi yang relevan dalam dokumen, database, maupun chat logs."
+            return "Maaf, tidak ditemukan informasi yang relevan dalam dokumen, database, maupun chat logs.", model_id
 
         # Prepare context from all sources
         context_parts = []
@@ -781,26 +952,148 @@ JAWABAN:"""
                 context_parts.append(f"{truncated_content}\n")
 
         context = "\n".join(context_parts)
-        context = self.truncate_context(context, max_tokens=600)  # Increased for 3 sources
+        context = self.truncate_context(context, max_tokens=400)  # Reduced for flan-t5 context limit
 
-        # Enhanced prompt for hybrid answers
-        prompt_template = """Berdasarkan informasi dari dokumen, database, dan chat logs berikut, jawab pertanyaan dengan jelas dan akurat. 
-Sertakan informasi dari semua sumber yang relevan. Prioritaskan informasi dengan skor relevansi tinggi.
+        # Extract main keyword from question for focused answering
+        question_lower = question.lower()
+        main_keyword = ""
+        for keyword in ['buyback cash', 'buyback debt switch', 'lelang', 'auction', 'settlement', 'lpdu', 'sbn', 'sun']:
+            if keyword in question_lower:
+                main_keyword = keyword
+                break
+        
+        # Improved prompt that focuses on the specific question
+        if main_keyword:
+            prompt_template = """Berikan definisi atau penjelasan tentang "{keyword}" berdasarkan konteks berikut.
 
+Konteks:
 {context}
 
-PERTANYAAN: {question}
+Pertanyaan: {question}
 
-JAWABAN:"""
+Jawaban tentang {keyword}:"""
+            prompt = prompt_template.format(keyword=main_keyword, context=context, question=question)
+        else:
+            prompt_template = """Jawab pertanyaan berikut berdasarkan konteks. Jawab dalam Bahasa Indonesia.
 
-        prompt = prompt_template.format(context=context, question=question)
+Konteks:
+{context}
+
+Pertanyaan: {question}
+
+Jawaban:"""
+            prompt = prompt_template.format(context=context, question=question)
+        
+        logger.debug(f"Generated prompt length: {len(prompt)} chars, using model: {model_id}")
 
         try:
-            result = self.llm.invoke(prompt)
-            return result.strip()
+            result = llm.invoke(prompt)
+            
+            # Handle different response types (ChatOllama returns AIMessage, HuggingFace returns str)
+            if hasattr(result, 'content'):
+                answer = result.content.strip()
+            else:
+                answer = str(result).strip()
+            
+            # Validate answer - if it looks garbled, return fallback
+            if self._is_garbled_output(answer):
+                logger.warning(f"Garbled output detected: {answer[:100]}")
+                fallback = self._generate_fallback_answer(hybrid_results, question)
+                return fallback, model_id
+            
+            return answer, model_id
+        except Exception as e:
+            logger.error(f"LLM generation failed: {str(e)}")
+            return "Maaf, terjadi kesalahan dalam menghasilkan jawaban.", model_id
         except Exception as e:
             logger.error(f"LLM generation failed: {str(e)}")
             return "Maaf, terjadi kesalahan dalam menghasilkan jawaban."
+    
+    def _is_garbled_output(self, text: str) -> bool:
+        """Check if output looks garbled/reversed"""
+        if not text or len(text) < 10:
+            return True
+        
+        # Check for reversed text patterns (consonant clusters that don't make sense)
+        import re
+        # If more than 30% of words have 4+ consecutive consonants, likely garbled
+        words = text.split()
+        consonant_pattern = re.compile(r'[bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ]{4,}')
+        garbled_words = sum(1 for w in words if consonant_pattern.search(w))
+        
+        if len(words) > 0 and garbled_words / len(words) > 0.3:
+            return True
+        
+        return False
+    
+    def _generate_fallback_answer(self, hybrid_results: Dict[str, Any], question: str) -> str:
+        """Generate a simpler fallback answer when LLM produces garbage"""
+        pdf_docs = hybrid_results.get('pdf_documents', [])
+        question_lower = question.lower()
+        
+        # Extract keywords from question
+        keywords = []
+        for word in question_lower.split():
+            if len(word) > 3:
+                keywords.append(word)
+        
+        if pdf_docs:
+            # Find the most relevant document based on question keywords
+            best_doc = None
+            best_score = 0
+            
+            for doc in pdf_docs:
+                content_lower = doc.page_content.lower()
+                # Count how many question keywords appear in the content
+                matches = sum(1 for kw in keywords if kw in content_lower)
+                doc_score = doc.metadata.get('similarity_score', 0) + (matches * 0.1)
+                
+                if doc_score > best_score:
+                    best_score = doc_score
+                    best_doc = doc
+            
+            if best_doc is None:
+                best_doc = pdf_docs[0]
+            
+            source = best_doc.metadata.get('source', 'dokumen')
+            page = best_doc.metadata.get('page', '?')
+            
+            # Try to extract relevant sentence containing keyword
+            content = best_doc.page_content
+            relevant_snippet = self._extract_relevant_snippet(content, keywords)
+            
+            if relevant_snippet:
+                return f"Berdasarkan {source} (halaman {page}):\n\n{relevant_snippet}"
+            else:
+                content = self.truncate_context(content, max_tokens=150)
+                return f"Berdasarkan {source} (halaman {page}):\n\n{content}"
+        
+        return "Maaf, sistem tidak dapat menghasilkan jawaban yang valid. Silakan coba pertanyaan yang lebih spesifik."
+    
+    def _extract_relevant_snippet(self, content: str, keywords: list) -> str:
+        """Extract the most relevant sentence/paragraph containing keywords"""
+        if not keywords:
+            return ""
+        
+        # Split into sentences
+        import re
+        sentences = re.split(r'[.!?]\s+', content)
+        
+        best_sentence = ""
+        best_matches = 0
+        
+        for sentence in sentences:
+            sentence_lower = sentence.lower()
+            matches = sum(1 for kw in keywords if kw in sentence_lower)
+            if matches > best_matches:
+                best_matches = matches
+                best_sentence = sentence.strip()
+        
+        if best_sentence and len(best_sentence) > 20:
+            # Include a bit more context (up to 300 chars)
+            return best_sentence[:300] + ("..." if len(best_sentence) > 300 else "")
+        
+        return ""
 
     def get_source_info(self, hybrid_results: Dict[str, Any]) -> List[SourceInfo]:
         """Extract source information for response"""

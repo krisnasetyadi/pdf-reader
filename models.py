@@ -62,6 +62,19 @@ class DatabaseResult(BaseModel):
     record_count: int
     avg_relevance_score: Optional[float] = None  # Average score dari search results
 
+
+class PdfSourceInfo(BaseModel):
+    """PDF source with URL for direct access"""
+    file_name: str
+    collection_id: str
+    page: Optional[int] = None
+    relevance_score: Optional[float] = None
+    content_preview: Optional[str] = None
+    file_url: Optional[str] = None  # URL to access the PDF
+    page_url: Optional[str] = None  # URL with page parameter for direct jump
+    search_text: Optional[str] = None  # Text snippet for highlighting/searching in PDF viewer
+
+
 # models.py - Add these fields to HybridQueryRequest
 class HybridQueryRequest(BaseModel):
     question: str
@@ -69,22 +82,24 @@ class HybridQueryRequest(BaseModel):
     include_pdf_results: bool = True
     include_db_results: bool = True
     include_chat_results: bool = True  # NEW: Search in chat logs?
-    # collection_id: Optional[str] = None  # Optional: search specific PDF collection
-    # include_pdf_results: bool = True     # Search in PDFs? 
-    # include_db_results: bool = True      # Search in database?
-    # db_result_limit: int = 5             # Limit DB results
     
-    # # New: Control search behavior
-    # search_all_collections: bool = True  # If no collection_id, search all PDFs?
+    # LLM Selection (optional - defaults to config if not provided)
+    llm_provider: Optional[str] = None  # "huggingface", "ollama", "gemini"
+    llm_model: Optional[str] = None     # specific model name
 
 class HybridResponse(BaseModel):
     answer: str
-    pdf_sources: List[str]
+    pdf_sources: List[str]  # Keep for backward compatibility
+    pdf_sources_detailed: Optional[List[PdfSourceInfo]] = None  # NEW: Detailed PDF sources with URLs
     db_results: Dict[str, Any]
     chat_results: Optional[List[Dict[str, Any]]] = None  # NEW: Chat search results
     processing_time: float
     search_terms: List[str]
     target_tables: Optional[List[str]] = None  # Tables that were searched (smart routing)
+    
+    # Model info - tells user which model generated this response
+    model_used: str  # e.g., "huggingface/google/flan-t5-base"
+    available_models: Optional[Dict[str, List[str]]] = None  # Only returned on first request or error
 
     # answer: str
     # pdf_sources: List[str]

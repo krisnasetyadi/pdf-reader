@@ -1,22 +1,45 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 import logging
 import asyncio
 from datetime import datetime
 from typing import List, Optional
 
 from processor import processor
-from config import config
-from models import HybridQueryRequest, HybridResponse, QueryRequest, SearchType
+from config import config, AVAILABLE_MODELS, LLMProvider
+from models import HybridQueryRequest, HybridResponse, QueryRequest, SearchType, PdfSourceInfo
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+
+@router.get('/models/available')
+async def get_available_models():
+    """Get list of available LLM models (all FREE)"""
+    return {
+        "default_provider": config.llm_provider.value,
+        "default_model": config.model_name,
+        "available_models": {provider.value: models for provider, models in AVAILABLE_MODELS.items()},
+        "usage_hint": "Send 'llm_provider' and 'llm_model' in your query request to switch models"
+    }
+
+
 @router.post('/query/hybrid', response_model=HybridResponse)
-async def hybrid_query(request: HybridQueryRequest):
-    """Hybrid query across PDF documents, database, and chat logs"""
+async def hybrid_query(request: HybridQueryRequest, req: Request):
+    """
+    Hybrid query across PDF documents, database, and chat logs.
+    
+    Optional LLM selection:
+    - llm_provider: "huggingface" | "ollama" | "gemini" (default: huggingface)
+    - llm_model: specific model name (see /api/v1/models/available)
+    """
     start_time = datetime.now()
+    
+    # Get base URL for file serving
+    base_url = str(req.base_url).rstrip('/')
 
     logger.info(f"🔍 Hybrid query received: {request.question}")
+    if request.llm_provider or request.llm_model:
+        logger.info(f"🤖 LLM override: provider={request.llm_provider}, model={request.llm_model}")
     
     try:
         # Validate question
@@ -52,22 +75,55 @@ async def hybrid_query(request: HybridQueryRequest):
             should_search_chat  # Pass include_chat flag
         )
 
-        # Generate answer
-        answer = await asyncio.to_thread(
-            processor.generate_hybrid_answer, hybrid_results, request.question
+        # Generate answer with optional LLM selection
+        answer, model_used = await asyncio.to_thread(
+            processor.generate_hybrid_answer, 
+            hybrid_results, 
+            request.question,
+            request.llm_provider,
+            request.llm_model
         )
 
         # Prepare response
         processing_time = (datetime.now() - start_time).total_seconds()
 
-        # Extract PDF sources
+        # Extract PDF sources (simple format for backward compatibility)
         pdf_sources = []
+        pdf_sources_detailed = []
         pdf_docs = hybrid_results.get('pdf_documents', [])
+        
         for doc in pdf_docs:
-            source_info = f"{doc.metadata.get('source', 'Unknown')}"
-            if 'page' in doc.metadata:
-                source_info += f" (Halaman {doc.metadata['page']})"
+            file_name = doc.metadata.get('source', 'Unknown')
+            collection_id = doc.metadata.get('collection_id', '')
+            page = doc.metadata.get('page')
+            score = doc.metadata.get('similarity_score', 0)
+            
+            # Simple format (backward compatible)
+            source_info = f"{file_name}"
+            if page:
+                source_info += f" (Halaman {page})"
             pdf_sources.append(source_info)
+            
+            # Detailed format with URLs
+            # URL format: /api/v1/files/{collection_id}/{filename}#page={page}
+            file_url = f"{base_url}/api/v1/files/{collection_id}/{file_name}" if collection_id else None
+            page_url = f"{file_url}#page={page}" if file_url and page else file_url
+            
+            # Extract first meaningful sentence from content for search highlighting
+            content_text = doc.page_content.strip()
+            # Get first 50-100 chars as search text (clean version)
+            search_text = ' '.join(content_text.split()[:15])  # First ~15 words
+            
+            pdf_sources_detailed.append(PdfSourceInfo(
+                file_name=file_name,
+                collection_id=collection_id,
+                page=page,
+                relevance_score=score,
+                content_preview=doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                file_url=file_url,
+                page_url=page_url,
+                search_text=search_text
+            ))
 
         # Extract chat results
         chat_results = []
@@ -83,16 +139,18 @@ async def hybrid_query(request: HybridQueryRequest):
 
         # Log search results
         target_tables = hybrid_results.get('target_tables', [])
-        logger.info(f"✅ Search completed - PDFs: {len(pdf_sources)}, DB: {len(hybrid_results.get('database_results', {}))}, Chats: {len(chat_results)}")
+        logger.info(f"✅ Search completed - Model: {model_used}, PDFs: {len(pdf_sources)}, DB: {len(hybrid_results.get('database_results', {}))}, Chats: {len(chat_results)}")
 
         return HybridResponse(
             answer=answer,
             pdf_sources=pdf_sources,
+            pdf_sources_detailed=pdf_sources_detailed if pdf_sources_detailed else None,
             db_results=hybrid_results.get('database_results', {}),
             chat_results=chat_results if chat_results else None,
             processing_time=processing_time,
             search_terms=hybrid_results.get('search_terms', []),
-            target_tables=target_tables
+            target_tables=target_tables,
+            model_used=model_used
         )
     
     except HTTPException:

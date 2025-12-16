@@ -1,15 +1,56 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
-from typing import List
+from typing import List, Optional
+from enum import Enum
 
 
 # Whitelist of allowed table names (security: prevents SQL injection)
 ALLOWED_TABLES = frozenset(["user_profiles", "products", "orders"])
 
 
+class LLMProvider(str, Enum):
+    """Supported LLM providers (FREE only)"""
+    HUGGINGFACE = "huggingface"  # Local, free, default
+    OLLAMA = "ollama"            # Local, free, requires Ollama installed
+    GEMINI = "gemini"            # Cloud, free tier (60 req/min)
+
+
+# Available models per provider
+AVAILABLE_MODELS = {
+    LLMProvider.HUGGINGFACE: [
+        "google/flan-t5-base",      # Default, smaller
+        "google/flan-t5-large",     # Better quality, more RAM
+        "google/flan-t5-xl",        # Best quality, needs GPU
+    ],
+    LLMProvider.OLLAMA: [
+        "qwen2.5:7b",               # Good for Asian languages
+        "llama3.2",                 # General purpose
+        "mistral",                  # Fast, good quality
+        "phi3",                     # Small but capable
+    ],
+    LLMProvider.GEMINI: [
+        "gemini-1.5-flash",         # Fast, free tier
+        "gemini-1.5-pro",           # Better quality
+    ],
+}
+
+
 class Config(BaseSettings):
-    # Model settings
-    model_name: str = Field(...)
+    # Default LLM Provider (used if no parameter sent)
+    llm_provider: LLMProvider = Field(default=LLMProvider.HUGGINGFACE)
+    
+    # HuggingFace settings (local - default)
+    model_name: str = Field(default="google/flan-t5-base")
+    
+    # Ollama settings (local)
+    ollama_model: str = Field(default="qwen2.5:7b")
+    ollama_base_url: str = Field(default="http://localhost:11434")
+    
+    # Gemini settings (cloud - free tier)
+    gemini_api_key: Optional[str] = Field(default=None)
+    gemini_model: str = Field(default="gemini-1.5-flash")
+    
+    # Common LLM settings
     embedding_model: str = Field(...)
     max_new_tokens: int = Field(...)
     temperature: float = Field(...)

@@ -1,172 +1,364 @@
-# 📄 PDF QA API
+# 📄 PDF QA Assistant
 
-A FastAPI-based API for uploading PDF documents, indexing them, and querying their content using natural language. It uses HuggingFace Transformers, FAISS for vector search, and LangChain for question answering.
-
----
-
-## 🚀 Features
-
-- Upload PDF files and create searchable collections
-- Query documents using natural language
-- Get answers with source document references
-- View and manage uploaded document collections
-- Uses pretrained models (`google/flan-t5-large`, `all-MiniLM-L6-v2`)
-- Powered by HuggingFace, FAISS, and LangChain
+An intelligent document question-answering system that combines **PDF documents**, **Database**, and **Chat Logs** search with AI-powered responses. Built with FastAPI, LangChain, FAISS, and multiple LLM providers (HuggingFace, Ollama, Gemini).
 
 ---
 
-## 📦 Project Structure
+## 🎯 Key Features
+
+### Core Features
+- 📄 **PDF Upload & Indexing** - Upload PDFs, automatically chunk and index for semantic search
+- 🔍 **Hybrid Search** - Search across PDFs, PostgreSQL database, and chat logs simultaneously
+- 🤖 **Multi-LLM Support** - Switch between HuggingFace (local), Ollama (local), or Gemini (cloud)
+- 💬 **Chat Log Import** - Import WhatsApp, Telegram, Teams chat exports for searching
+- 🎯 **Smart Routing** - Automatically routes queries to relevant data sources
+
+### Advanced Features
+- 📊 **Database Integration** - Query structured data with natural language
+- 🔗 **PDF Source Links** - Direct links to PDF pages with source text
+- ⚡ **Query Expansion** - Automatic synonym and keyword expansion for better recall
+- 🌐 **REST API** - Full OpenAPI/Swagger documentation
+
+---
+
+## 🏗️ System Architecture
 
 ```
-app/
-├── main.py # FastAPI app and router setup
-├── config/ # Configuration settings
-├── processor/ # ML pipeline setup
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PDF QA ASSISTANT                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────┐     ┌─────────────────────────────────────────────────┐   │
+│  │   Chat UI   │────▶│              FastAPI Backend                    │   │
+│  │  (Next.js)  │◀────│                 (Python)                        │   │
+│  └─────────────┘     └─────────────────────────────────────────────────┘   │
+│        :3001                           :8000                                │
+│                                          │                                  │
+│                    ┌─────────────────────┼─────────────────────┐           │
+│                    ▼                     ▼                     ▼           │
+│           ┌──────────────┐      ┌──────────────┐      ┌──────────────┐    │
+│           │  PDF Search  │      │  DB Search   │      │ Chat Search  │    │
+│           │   (FAISS)    │      │ (PostgreSQL) │      │   (FAISS)    │    │
+│           └──────────────┘      └──────────────┘      └──────────────┘    │
+│                    │                     │                     │           │
+│                    └─────────────────────┼─────────────────────┘           │
+│                                          ▼                                  │
+│                              ┌─────────────────────┐                       │
+│                              │    LLM Provider     │                       │
+│                              │  ┌───────────────┐  │                       │
+│                              │  │ HuggingFace   │  │                       │
+│                              │  │ Ollama        │  │                       │
+│                              │  │ Gemini        │  │                       │
+│                              │  └───────────────┘  │                       │
+│                              └─────────────────────┘                       │
+│                                          │                                  │
+│                                          ▼                                  │
+│                              ┌─────────────────────┐                       │
+│                              │   Generated Answer  │                       │
+│                              │   + Source Links    │                       │
+│                              └─────────────────────┘                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📁 Project Structure
+
+```
+pdf-reader/
+├── main.py                    # FastAPI application entry point
+├── config.py                  # Configuration (env vars, models, paths)
+├── processor.py               # Core ML pipeline (embeddings, LLM, search)
+├── database.py                # PostgreSQL database manager
+├── models.py                  # Pydantic request/response models
+├── utils.py                   # PDF processing utilities
+├── requirements.txt           # Python dependencies
+│
 ├── router/
-│ ├── upload.py # Upload PDF files
-│ ├── query.py # Query PDFs with natural language
-│ └── collections.py # Manage document collections
-├── models.py # Pydantic models
-├── utils.py # PDF processing utilities
+│   ├── __init__.py
+│   ├── upload.py              # PDF upload endpoints
+│   ├── collections.py         # PDF collection management + file serving
+│   ├── hybrid.py              # Main hybrid search endpoint
+│   ├── query.py               # Legacy query endpoint
+│   └── chat.py                # Chat log upload & management
+│
+├── data/
+│   ├── uploads/               # Uploaded PDF files (by collection UUID)
+│   │   └── {collection-id}/
+│   │       └── *.pdf
+│   ├── indices/               # FAISS vector indices for PDFs
+│   │   └── {collection-id}/
+│   │       ├── index.faiss
+│   │       └── index.pkl
+│   ├── chat_uploads/          # Uploaded chat log files
+│   └── chat_indices/          # FAISS vector indices for chats
+│
+└── .env                       # Environment variables (not in git)
 ```
 
-## ⚙️ Setup Instructions
+---
 
-### 1. Clone the repository
+## 🔄 Application Flow
 
-```bash
-git clone <your-repo-url>
-cd <your-repo-folder>
+### Flow 1: PDF Upload & Indexing
+
+```
+┌──────────┐    ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
+│  User    │───▶│ POST /upload│───▶│ PDF Parsing  │───▶│  Chunking   │
+│ uploads  │    │   (FastAPI) │    │  (PyPDF2)    │    │ (600 chars) │
+│  PDFs    │    └─────────────┘    └──────────────┘    └─────────────┘
+└──────────┘                                                  │
+                                                              ▼
+┌──────────┐    ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
+│Collection│◀───│ Save Index  │◀───│ FAISS Index  │◀───│ Embeddings  │
+│   ID     │    │  to Disk    │    │  Creation    │    │(MiniLM-L12) │
+└──────────┘    └─────────────┘    └──────────────┘    └─────────────┘
 ```
 
-### 2. Create a virtual environment and install dependencies
+**Steps:**
+1. User uploads PDF file(s) via `/api/v1/upload`
+2. PDFs are saved to `data/uploads/{collection-id}/`
+3. Text extracted using PyPDF2
+4. Text chunked into 600-char segments with 100-char overlap
+5. Chunks embedded using `paraphrase-multilingual-MiniLM-L12-v2`
+6. FAISS index created and saved to `data/indices/{collection-id}/`
+7. Collection ID returned to user
+
+---
+
+### Flow 2: Hybrid Query (Main Feature)
+
+```
+┌──────────┐    ┌─────────────────┐    ┌──────────────────────────────┐
+│  User    │───▶│ POST /query/    │───▶│     Question Analysis        │
+│  asks    │    │     hybrid      │    │  - Detect keywords           │
+│ question │    └─────────────────┘    │  - Expand synonyms           │
+└──────────┘                           │  - Route to data sources     │
+                                       └──────────────────────────────┘
+                                                      │
+                    ┌─────────────────────────────────┼─────────────────────────────────┐
+                    ▼                                 ▼                                 ▼
+           ┌────────────────┐               ┌────────────────┐               ┌────────────────┐
+           │  PDF Search    │               │  DB Search     │               │  Chat Search   │
+           │  (FAISS)       │               │  (PostgreSQL)  │               │  (FAISS)       │
+           │                │               │                │               │                │
+           │ • Similarity   │               │ • Smart table  │               │ • Similarity   │
+           │   search       │               │   routing      │               │   search       │
+           │ • Top-k docs   │               │ • Full-text    │               │ • Top-k chats  │
+           │ • Score > 0.5  │               │   search       │               │ • Score > 0.3  │
+           └────────────────┘               └────────────────┘               └────────────────┘
+                    │                                 │                                 │
+                    └─────────────────────────────────┼─────────────────────────────────┘
+                                                      ▼
+                                       ┌──────────────────────────────┐
+                                       │      Context Preparation     │
+                                       │  - Combine all results       │
+                                       │  - Truncate to token limit   │
+                                       │  - Add source metadata       │
+                                       └──────────────────────────────┘
+                                                      │
+                                                      ▼
+                                       ┌──────────────────────────────┐
+                                       │        LLM Generation        │
+                                       │  - Select provider/model     │
+                                       │  - Generate answer           │
+                                       │  - Validate output           │
+                                       └──────────────────────────────┘
+                                                      │
+                                                      ▼
+                                       ┌──────────────────────────────┐
+                                       │         Response             │
+                                       │  - Answer text               │
+                                       │  - PDF sources with URLs     │
+                                       │  - DB results                │
+                                       │  - Chat results              │
+                                       │  - Processing time           │
+                                       └──────────────────────────────┘
+```
+
+**Steps:**
+1. User sends question to `/api/v1/query/hybrid`
+2. System analyzes question:
+   - Extracts keywords (e.g., "buyback cash")
+   - Expands with synonyms
+   - Determines target data sources (PDF/DB/Chat)
+3. Parallel search across all sources:
+   - **PDF**: FAISS similarity search with score threshold
+   - **Database**: Smart table routing + full-text search
+   - **Chat**: FAISS similarity search on chat logs
+4. Results combined and truncated for LLM context
+5. LLM generates answer (HuggingFace/Ollama/Gemini)
+6. Response includes answer + source links
+
+---
+
+### Flow 3: View PDF Source
+
+```
+┌──────────┐    ┌─────────────────┐    ┌──────────────────────────────┐
+│  User    │───▶│ Click "View PDF"│───▶│     PDF Viewer Dialog        │
+│  clicks  │    │  in chat UI     │    │  - Opens at specific page    │
+│  source  │    └─────────────────┘    │  - Shows source text         │
+└──────────┘                           │  - Copy/search functionality │
+                                       └──────────────────────────────┘
+                                                      │
+                                                      ▼
+                                       ┌──────────────────────────────┐
+                                       │  GET /files/{collection}/    │
+                                       │       {filename}#page=N      │
+                                       │  - Serves PDF file           │
+                                       │  - Browser navigates to page │
+                                       └──────────────────────────────┘
+```
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+- Python 3.10+
+- PostgreSQL 13+ (optional, for database search)
+- Node.js 18+ (for frontend)
+
+### 1. Clone & Setup Backend
 
 ```bash
+git clone https://github.com/krisnasetyadi/pdf-reader.git
+cd pdf-reader
+
+# Create virtual environment
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # Linux/Mac
+# or: .\venv\Scripts\Activate.ps1  # Windows PowerShell
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Run The Server
+### 2. Configure Environment
+
+Create `.env` file:
+
+```env
+# Database (optional)
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=pdf_reader
+DB_USER=postgres
+DB_PASSWORD=your_password
+
+# CORS
+CORS_ORIGINS=http://localhost:3001,http://localhost:3000
+
+# LLM Provider: huggingface | ollama | gemini
+LLM_PROVIDER=huggingface
+MODEL_NAME=google/flan-t5-base
+
+# Optional: Gemini API (free tier)
+# GEMINI_API_KEY=your_api_key
+
+# Optional: Ollama (local)
+# OLLAMA_BASE_URL=http://localhost:11434
+# OLLAMA_MODEL=llama3.2
+```
+
+### 3. Run Backend
 
 ```bash
-uvicorn main:app --reload
+uvicorn main:app --reload --port 8000
 ```
 
-### Configuration
-
-The default configuration is defined in config/config.py.
-You can adjust:
-
-    model_name: "google/flan-t5-large"
-    embedding_model: "all-MiniLM-L6-v2"
-
-    For document chunking:
-
-    chunk_size:1000
-    chunk_overlap: 200
-
-    Storage paths:
-    upload_folder: "uploads"
-    index_folder: "indices"
-
-# API Documentation
-
-## 🔼 Upload PDFs
-
-`POST /upload`
-
-Upload one or more PDF files to create a new collection.
-
-### Request (multipart/form-data)
-
-- `files`: List of PDF files
-
-### Response (200 OK)
-
-```json
-{
-  "collection_id": "string",
-  "file_count": 3,
-  "status": "success"
-}
-```
+### 4. Setup Frontend (Optional)
 
 ```bash
-{
-  "answer": "The main topic is...",
-  "sources": [
-    "document1.pdf (page 2)",
-    "document2.pdf (page 5)"
-  ],
-  "collection_id": "your-collection-id",
-  "processing_time": 1.23
-}
+cd ../chat-ui
+npm install
+npm run dev
 ```
 
-```json
-{
-  "answer": "The main topic is...",
-  "sources": ["document1.pdf (page 2)", "document2.pdf (page 5)"],
-  "collection_id": "your-collection-id",
-  "processing_time": 1.23
-}
+Open http://localhost:3001
+
+---
+
+## 📡 API Endpoints
+
+### Health Check
+```
+GET /health
 ```
 
-## ❓ Query Documents
-
-`POST /query`
-
-Query the content of your uploaded PDFs using natural language.
-
-### Request Body (JSON)
-
-```json
-{
-  "question": "What is the main topic of the document?",
-  "collection_id": "optional-collection-id",
-  "include_sources": true
-}
+### PDF Management
+```
+POST   /api/v1/upload                    # Upload PDFs
+GET    /api/v1/collections               # List all collections
+GET    /api/v1/collection/{id}           # Get collection details
+DELETE /api/v1/collection/{id}           # Delete collection
+GET    /api/v1/files/{collection}/{file} # Serve PDF file
 ```
 
-```json
-{
-  "answer": "The main topic is...",
-  "sources": ["document1.pdf (page 2)", "document2.pdf (page 5)"],
-  "collection_id": "your-collection-id",
-  "processing_time": 1.23
-}
+### Hybrid Search (Main)
+```
+POST   /api/v1/query/hybrid              # Search PDFs + DB + Chats
+GET    /api/v1/models/available          # List available LLM models
 ```
 
-### Collections
-
-`GET /collections`
-
-Get a list of available document collections.
-
-Response (200 OK)
-
-```json
-[
-  {
-    "collection_id": "abc123",
-    "document_count": 2,
-    "created_at": "2025-05-20T10:00:00",
-    "file_names": ["report1.pdf", "report2.pdf"]
-  }
-]
+### Chat Logs
+```
+POST   /api/v1/chat/upload               # Upload chat export
+GET    /api/v1/chat/collections          # List chat collections
+DELETE /api/v1/chat/collection/{id}      # Delete chat collection
 ```
 
-`DELETE /collection/{collection_id}`
+---
 
-Delete a specific document collection by its ID.
+## 🔧 Configuration Options
 
-Path Parameter
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_PROVIDER` | `huggingface` | LLM provider (huggingface/ollama/gemini) |
+| `MODEL_NAME` | `google/flan-t5-base` | HuggingFace model |
+| `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence embeddings |
+| `CHUNK_SIZE` | `600` | Text chunk size |
+| `CHUNK_OVERLAP` | `100` | Overlap between chunks |
+| `K_RESULTS` | `5` | Results per search |
+| `TEMPERATURE` | `0.3` | LLM temperature |
 
-- collection_id: The ID of the collection to delete
+---
 
-```json
-{
-  "message": "Collection deleted successfully"
-}
-```
+## 🌐 Deployment
+
+### Free Deployment Stack
+- **Frontend**: Vercel (unlimited)
+- **Backend**: Hugging Face Spaces (16GB RAM free)
+- **Database**: Neon PostgreSQL (512MB free)
+
+See deployment guide in `/docs/DEPLOYMENT.md`
+
+---
+
+## 🛠️ Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| Backend Framework | FastAPI |
+| LLM | HuggingFace Transformers / Ollama / Gemini |
+| Embeddings | sentence-transformers (MiniLM) |
+| Vector Store | FAISS |
+| Orchestration | LangChain |
+| Database | PostgreSQL |
+| Frontend | Next.js 16 + React 19 |
+| UI Components | shadcn/ui + Radix UI |
+| Styling | Tailwind CSS |
+
+---
+
+## 📄 License
+
+MIT License - see LICENSE file
+
+---
+
+## 👤 Author
+
+**Krisna Setyadi**
+- GitHub: [@krisnasetyadi](https://github.com/krisnasetyadi)
