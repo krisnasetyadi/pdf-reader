@@ -895,7 +895,6 @@ Answer:"""
         # Add DB context with relevance scores
         if has_db_results:
             context_parts.append("INFORMASI DARI DATABASE:")
-            context_parts.append(f"(Tabel yang dicari: {', '.join(target_tables)})")
             
             for table_name, db_result in db_results.items():
                 if db_result.record_count > 0:
@@ -906,17 +905,16 @@ Answer:"""
                         reverse=True
                     )
                     
-                    context_parts.append(f"\\nData dari tabel {table_name} ({db_result.record_count} record):")
+                    context_parts.append(f"\nData dari tabel {table_name}:")
                     for i, record in enumerate(sorted_records[:3]): # Limit to top 3 records
-                        relevance = record.get('relevance_score', 'N/A')
-                        # Filter out internal fields
+                        # Filter out internal fields - cleaner format for LLM
                         display_fields = {k: v for k, v in record.items() 
-                                         if not k.startswith('_') and k not in ['search_vector', 'relevance_score']}
-                        record_str = ", ".join(f"{k}: {v}" for k, v in list(display_fields.items())[:5])
-                        context_parts.append(f" - [Score: {relevance}] {record_str}")
+                                         if not k.startswith('_') and k not in ['search_vector', 'relevance_score', 'created_at']}
+                        record_str = ", ".join(f"{k}: {v}" for k, v in list(display_fields.items())[:6])
+                        context_parts.append(f"• {record_str}")
 
                     if db_result.record_count > 3:
-                        context_parts.append(f" - ... dan {db_result.record_count - 3} record lainnya")
+                        context_parts.append(f"(dan {db_result.record_count - 3} record lainnya)")
 
    
         if has_chat_results:
@@ -957,7 +955,18 @@ Pertanyaan: {question}
 Jawaban tentang {keyword}:"""
             prompt = prompt_template.format(keyword=main_keyword, context=context, question=question)
         else:
-            prompt_template = """Jawab pertanyaan berikut berdasarkan konteks. Jawab dalam Bahasa Indonesia.
+            # Check if this is primarily a database question
+            if has_db_results and not has_pdf_results:
+                prompt_template = """Berdasarkan data berikut, jawab pertanyaan dengan format yang jelas dan informatif.
+
+Data:
+{context}
+
+Pertanyaan: {question}
+
+Jawaban:"""
+            else:
+                prompt_template = """Jawab pertanyaan berikut berdasarkan konteks. Jawab dalam Bahasa Indonesia.
 
 Konteks:
 {context}
@@ -987,24 +996,68 @@ Jawaban:"""
             return answer, model_id
         except Exception as e:
             logger.error(f"LLM generation failed: {str(e)}")
-            return "Maaf, terjadi kesalahan dalam menghasilkan jawaban.", model_id
-        except Exception as e:
-            logger.error(f"LLM generation failed: {str(e)}")
-            return "Maaf, terjadi kesalahan dalam menghasilkan jawaban."
+            fallback = self._generate_fallback_answer(hybrid_results, question)
+            return fallback, model_id
     
     def _is_garbled_output(self, text: str) -> bool:
-        """Check if output looks garbled/reversed"""
+        """Check if output looks garbled/reversed or unhelpful"""
         if not text or len(text) < 10:
             return True
         
-        # Check for reversed text patterns (consonant clusters that don't make sense)
+        text_lower = text.lower()
+        
+        # Check for common garbled/unhelpful patterns from flan-t5
+        unhelpful_patterns = [
+            'pertanyaan pertanyaan',
+            'berdasar konteks',
+            'jawab pertanyaan',
+            'answer the question',
+            'based on context',
+            'tidak ada informasi',
+            'no information',
+            'context:',
+            'question:',
+            'yang bersama yang bersama',  # repetitive garbled output
+            'bersama yang bersama',
+            'yang berkata terjadi',  # another garbled pattern
+            'berkata tidak berkata',
+            'data pertanyaan tahun',
+            'data pertanyaan tersebut',
+            'format yang bersah',
+        ]
+        
+        for pattern in unhelpful_patterns:
+            if pattern in text_lower:
+                return True
+        
+        # Check for repetitive patterns (same word repeated 5+ times)
         import re
-        # If more than 30% of words have 4+ consecutive consonants, likely garbled
-        words = text.split()
+        words = text_lower.split()
+        if len(words) > 5:
+            from collections import Counter
+            word_counts = Counter(words)
+            most_common = word_counts.most_common(1)
+            if most_common and most_common[0][1] >= 5 and most_common[0][1] / len(words) > 0.3:
+                return True
+        
+        # Check for reversed text patterns (consonant clusters that don't make sense)
         consonant_pattern = re.compile(r'[bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ]{4,}')
         garbled_words = sum(1 for w in words if consonant_pattern.search(w))
         
         if len(words) > 0 and garbled_words / len(words) > 0.3:
+            return True
+        
+        # If answer is too short and doesn't contain useful info
+        if len(words) < 5:
+            return True
+        
+        # Check if answer doesn't contain any expected content (names, data fields)
+        # If context had database results but answer has none of the field values, likely garbled
+        expected_markers = ['id:', 'name:', 'email:', '@', 'department:', 'position:', 'phone:']
+        has_expected = any(marker in text_lower for marker in expected_markers)
+        
+        # If text looks like repeated gibberish without any data markers
+        if not has_expected and 'yang' in text_lower and text_lower.count('yang') >= 3:
             return True
         
         return False
@@ -1012,6 +1065,8 @@ Jawaban:"""
     def _generate_fallback_answer(self, hybrid_results: Dict[str, Any], question: str) -> str:
         """Generate a simpler fallback answer when LLM produces garbage"""
         pdf_docs = hybrid_results.get('pdf_documents', [])
+        db_results = hybrid_results.get('database_results', {})
+        chat_docs = hybrid_results.get('chat_documents', [])
         question_lower = question.lower()
         
         # Extract keywords from question
@@ -1020,6 +1075,23 @@ Jawaban:"""
             if len(word) > 3:
                 keywords.append(word)
         
+        # Priority 1: Database results (most structured)
+        if db_results:
+            for table_name, db_result in db_results.items():
+                if db_result.record_count > 0:
+                    # Format database results nicely
+                    records_text = []
+                    for record in db_result.data[:3]:  # Limit to 3 records
+                        # Filter out internal fields
+                        display_fields = {k: v for k, v in record.items() 
+                                         if not k.startswith('_') and k not in ['search_vector', 'relevance_score', 'created_at']}
+                        record_str = ", ".join(f"{k}: {v}" for k, v in display_fields.items())
+                        records_text.append(f"• {record_str}")
+                    
+                    result_text = "\n".join(records_text)
+                    return f"Berdasarkan data dari tabel {table_name}:\n\n{result_text}"
+        
+        # Priority 2: PDF documents
         if pdf_docs:
             # Find the most relevant document based on question keywords
             best_doc = None
@@ -1050,6 +1122,14 @@ Jawaban:"""
             else:
                 content = self.truncate_context(content, max_tokens=150)
                 return f"Berdasarkan {source} (halaman {page}):\n\n{content}"
+        
+        # Priority 3: Chat results
+        if chat_docs:
+            best_chat = chat_docs[0]
+            source = best_chat.metadata.get('source', 'chat')
+            platform = best_chat.metadata.get('platform', 'unknown')
+            content = self.truncate_context(best_chat.page_content, max_tokens=200)
+            return f"Berdasarkan percakapan dari {source} ({platform}):\n\n{content}"
         
         return "Maaf, sistem tidak dapat menghasilkan jawaban yang valid. Silakan coba pertanyaan yang lebih spesifik."
     
