@@ -29,7 +29,7 @@ async def hybrid_query(request: HybridQueryRequest, req: Request):
     Hybrid query across PDF documents, database, and chat logs.
     
     Optional LLM selection:
-    - llm_provider: "huggingface" | "ollama" | "gemini" (default: huggingface)
+    - llm_provider: "huggingface" | "gemini" (default: huggingface)
     - llm_model: specific model name (see /api/v1/models/available)
     """
     start_time = datetime.now()

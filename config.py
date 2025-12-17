@@ -28,7 +28,6 @@ def parse_database_url(url: str) -> dict:
 class LLMProvider(str, Enum):
     """Supported LLM providers (FREE only)"""
     HUGGINGFACE = "huggingface"  # Local, free, default
-    OLLAMA = "ollama"            # Local, free, requires Ollama installed
     GEMINI = "gemini"            # Cloud, free tier (60 req/min)
 
 
@@ -39,15 +38,10 @@ AVAILABLE_MODELS = {
         "google/flan-t5-large",     # Better quality, more RAM
         "google/flan-t5-xl",        # Best quality, needs GPU
     ],
-    LLMProvider.OLLAMA: [
-        "qwen2.5:7b",               # Good for Asian languages
-        "llama3.2",                 # General purpose
-        "mistral",                  # Fast, good quality
-        "phi3",                     # Small but capable
-    ],
     LLMProvider.GEMINI: [
-        "gemini-1.5-flash",         # Fast, free tier
-        "gemini-1.5-pro",           # Better quality
+        "gemini-2.0-flash",         # Fast, free tier (recommended)
+        "gemini-2.5-flash",         # Latest flash model
+        "gemini-2.5-pro",           # Better quality
     ],
 }
 
@@ -59,13 +53,11 @@ class Config(BaseSettings):
     # HuggingFace settings (local - default)
     model_name: str = Field(default="google/flan-t5-base")
     
-    # Ollama settings (local)
-    ollama_model: str = Field(default="qwen2.5:7b")
-    ollama_base_url: str = Field(default="http://localhost:11434")
+    # (Ollama config removed for HuggingFace Spaces deployment)
     
     # Gemini settings (cloud - free tier)
     gemini_api_key: Optional[str] = Field(default=None)
-    gemini_model: str = Field(default="gemini-1.5-flash")
+    gemini_model: str = Field(default="gemini-2.0-flash")
     
     # Common LLM settings
     embedding_model: str = Field(...)

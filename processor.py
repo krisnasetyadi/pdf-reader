@@ -435,8 +435,6 @@ Answer:"""
         else:
             if llm_provider == LLMProvider.HUGGINGFACE:
                 llm_model = config.model_name
-            elif llm_provider == LLMProvider.OLLAMA:
-                llm_model = config.ollama_model
             elif llm_provider == LLMProvider.GEMINI:
                 llm_model = config.gemini_model
             else:
@@ -457,8 +455,6 @@ Answer:"""
         try:
             if llm_provider == LLMProvider.HUGGINGFACE:
                 llm = self._load_huggingface_llm(llm_model)
-            elif llm_provider == LLMProvider.OLLAMA:
-                llm = self._load_ollama_llm(llm_model)
             elif llm_provider == LLMProvider.GEMINI:
                 llm = self._load_gemini_llm(llm_model)
             else:
@@ -517,19 +513,6 @@ Answer:"""
         )
         
         return HuggingFacePipeline(pipeline=pipe)
-    
-    def _load_ollama_llm(self, model_name: str):
-        """Load Ollama model (local)"""
-        try:
-            from langchain_ollama import ChatOllama
-        except ImportError:
-            raise ImportError("Install langchain-ollama: pip install langchain-ollama")
-        
-        return ChatOllama(
-            model=model_name,
-            base_url=config.ollama_base_url,
-            temperature=config.temperature,
-        )
     
     def _load_gemini_llm(self, model_name: str):
         """Load Google Gemini model (cloud - free tier)"""
