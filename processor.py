@@ -424,8 +424,8 @@ Answer:"""
                 )
                 
                 for doc, score in results:
-                    # Only include results above threshold
-                    if score >= 0.3:  # Lower threshold for chat since context is important
+                    # Only include results above threshold (lowered from 0.3 to 0.05 for better recall)
+                    if score >= 0.05:  # Lower threshold for better recall, same as PDF search
                         doc.metadata['similarity_score'] = float(score)
                         doc.metadata['collection_id'] = collection_id
                         all_results.append(doc)
