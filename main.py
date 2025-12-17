@@ -46,14 +46,35 @@ async def startup_event():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "initialized": hasattr(processor, '_initialized')
-        and processor._initialized,
-        "pdf_collections_count": len(processor.get_all_collections()),
-        "chat_collections_count": len(processor.get_all_chat_collections())
-    }
+    """Comprehensive health check including database status"""
+    from datetime import datetime
+    try:
+        # Check processor initialization
+        pdf_collections = len(processor.get_all_collections()) if processor else 0
+        chat_collections = len(processor.get_all_chat_collections()) if processor else 0
+        
+        # Check database health
+        db_status = processor.db_manager.is_healthy() if processor and processor.db_manager else {
+            "status": "not_initialized",
+            "message": "Database manager not initialized", 
+            "can_query": False
+        }
+        
+        return {
+            "status": "healthy" if db_status["can_query"] else "degraded",
+            "initialized": hasattr(processor, '_initialized') and processor._initialized,
+            "pdf_collections_count": pdf_collections,
+            "chat_collections_count": chat_collections,
+            "database": db_status,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "database": {"status": "error", "message": str(e), "can_query": False},
+            "timestamp": datetime.now().isoformat()
+        }
 
 # Include routers
 from router.upload import router as upload_router

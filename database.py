@@ -19,12 +19,20 @@ def validate_table_name(table_name: str) -> str:
 class DatabaseManager:
     def __init__(self):
         self.connection = None
+        self._last_health_check = 0
+        self._health_check_interval = 300  # 5 minutes
         self.connect()
         self.initialize_dummy_data()
 
     def connect(self):
         "Establish database connection using db_config property"
         try:
+            if self.connection:
+                try:
+                    self.connection.close()
+                except:
+                    pass
+                    
             config = Config()
             db_config = config.db_config
             
@@ -40,6 +48,7 @@ class DatabaseManager:
             logger.info(f"Database connection established to {db_config['host']}")
         except Exception as e:
             logger.error(f"Failed to connect to database: {e}")
+            self.connection = None
             raise
 
     def initialize_dummy_data(self):
@@ -186,8 +195,71 @@ class DatabaseManager:
             logger.warning(f"FTS initialization failed (will use fallback ILIKE): {e}")
             self.connection.rollback()
 
+    def ensure_connection(self) -> bool:
+        """Ensure database connection is alive, reconnect if needed"""
+        import time
+        
+        # Check if we need to do health check
+        current_time = time.time()
+        if current_time - self._last_health_check < self._health_check_interval:
+            if self.connection and not self.connection.closed:
+                return True
+        
+        try:
+            # Test current connection
+            if self.connection and not self.connection.closed:
+                with self.connection.cursor() as cursor:
+                    cursor.execute("SELECT 1")
+                    cursor.fetchone()
+                    self._last_health_check = current_time
+                    return True
+        except Exception as e:
+            logger.warning(f"Database connection test failed: {e}")
+        
+        # Connection is dead, try to reconnect
+        try:
+            logger.info("Attempting to reconnect to database...")
+            self.connect()
+            self._last_health_check = current_time
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reconnect to database: {e}")
+            return False
+    
+    def is_healthy(self) -> Dict[str, Any]:
+        """Check database health status"""
+        try:
+            if not self.ensure_connection():
+                return {
+                    "status": "disconnected",
+                    "message": "Database connection failed",
+                    "can_query": False
+                }
+            
+            # Test basic query
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) as total FROM information_schema.tables WHERE table_schema = 'public'")
+                result = cursor.fetchone()
+                table_count = result['total'] if result else 0
+                
+                return {
+                    "status": "connected",
+                    "message": f"Database healthy with {table_count} tables",
+                    "can_query": True,
+                    "table_count": table_count
+                }
+        except Exception as e:
+            return {
+                "status": "error", 
+                "message": f"Database health check failed: {str(e)}",
+                "can_query": False
+            }
+    
     def get_table_schema(self, table_name: str) -> List[Dict[str, Any]]:
         """Get schema information for a table"""
+        if not self.ensure_connection():
+            raise ConnectionError("Database connection not available")
+            
         try:
             with self.connection.cursor() as cursor:
                 cursor.execute("""
@@ -304,6 +376,10 @@ class DatabaseManager:
 
     def search_with_fts(self, table_name: str, search_terms: List[str], limit: int = 10, phrases: List[str] = None) -> List[Dict[str, Any]]:
         """Full-Text Search with ts_rank scoring - prioritizes phrase matches"""
+        if not self.ensure_connection():
+            logger.error("Database connection not available for FTS search")
+            return []
+            
         try:
             # Validate table name against whitelist
             table_name = validate_table_name(table_name)
@@ -398,6 +474,10 @@ class DatabaseManager:
 
     def search_with_ilike(self, table_name: str, search_terms: List[str], limit: int = 10, phrases: List[str] = None) -> List[Dict[str, Any]]:
         """Fallback ILIKE search with basic scoring - case insensitive, prioritizes phrase matches"""
+        if not self.ensure_connection():
+            logger.error("Database connection not available for ILIKE search")
+            return []
+            
         try:
             # Validate table name against whitelist
             table_name = validate_table_name(table_name)
@@ -502,6 +582,10 @@ class DatabaseManager:
 
     def get_all_tables(self) -> List[str]:
         """Get list of all tables in the database"""
+        if not self.ensure_connection():
+            logger.error("Database connection not available for listing tables")
+            return []
+            
         try:
             with self.connection.cursor() as cursor:
                 cursor.execute("""
