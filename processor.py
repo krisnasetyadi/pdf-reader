@@ -6,7 +6,8 @@ from transformers import (
     GenerationConfig
 )
 import logging
-from langchain_huggingface import HuggingFacePipeline, HuggingFaceEmbeddings
+from langchain_community.llms import HuggingFacePipeline
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 import threading
 import torch
@@ -115,32 +116,60 @@ class PDFQAProcessor:
         """Get vector store from cache or load from disk with thread safety"""
         with self._cache_lock:
             if collection_id in self.vector_store_cache:
+                logger.debug(f"Returning cached vector store for {collection_id}")
                 return self.vector_store_cache[collection_id]
 
+            logger.info(f"🔍 Loading vector store for collection: {collection_id}")
             index_path = os.path.join(config.index_folder, collection_id)
+            logger.info(f"📁 Index path: {index_path}")
+            
             if not os.path.exists(index_path):
-                logger.warning(f"Index path not found: {index_path}")
+                logger.warning(f"❌ Index path not found: {index_path}")
+                return None
+
+            # Check if index files exist
+            faiss_file = os.path.join(index_path, "index.faiss")
+            pkl_file = os.path.join(index_path, "index.pkl")
+            logger.info(f"📄 FAISS file exists: {os.path.exists(faiss_file)}")
+            logger.info(f"📄 PKL file exists: {os.path.exists(pkl_file)}")
+            
+            if not all(os.path.exists(os.path.join(index_path, f))
+                       for f in ["index.faiss", "index.pkl"]):
+                logger.error(f"❌ Incomplete index files for {collection_id}")
+                return None
+
+            # Check embeddings are loaded
+            if self.embeddings is None:
+                logger.error("❌ Embeddings model not loaded!")
                 return None
 
             try:
-                # Check if index files exist
-                if not all(os.path.exists(os.path.join(index_path, f))
-                           for f in ["index.faiss", "index.pkl"]):
-                    logger.error(f"Incomplete index files for {collection_id}")
-                    return None
-
+                logger.info(f"🔄 Loading FAISS vector store from {index_path}")
                 vector_store = FAISS.load_local(
                     index_path,
                     self.embeddings,
                     allow_dangerous_deserialization=True
                 )
+                logger.info(f"✅ Successfully loaded vector store for {collection_id}")
+                
+                # Test the vector store with a simple search
+                try:
+                    test_results = vector_store.similarity_search("test", k=1)
+                    logger.info(f"🧪 Test search returned {len(test_results)} results")
+                except Exception as test_e:
+                    logger.error(f"❌ Test search failed: {test_e}")
+                    return None
+                
                 self.vector_store_cache[collection_id] = vector_store
                 return vector_store
 
             except Exception as e:
                 logger.error(
-                    f"Failed to load vector store for {collection_id}: {str(e)}"
+                    f"❌ Failed to load vector store for {collection_id}: {str(e)}"
                 )
+                logger.error(f"🔍 Error type: {type(e).__name__}")
+                import traceback
+                logger.error(f"🔍 Traceback: {traceback.format_exc()}")
                 return None
 
     def search_across_collections(self, query, collection_ids=None, top_k=5):
@@ -149,40 +178,59 @@ class PDFQAProcessor:
             collection_ids = self.get_all_collections()
 
         if not collection_ids:
-            logger.warning("No collections available for search")
+            logger.warning("❌ No collections available for search")
             return []
+
+        logger.info(f"🔍 Starting search across {len(collection_ids)} collections")
+        logger.info(f"📝 Query: '{query}'")
+        logger.info(f"📚 Collections: {collection_ids}")
 
         # Expand query for better retrieval
         expanded_queries = self.expand_query(query)
-        logger.info(f"Expanded queries: {expanded_queries}")
+        logger.info(f"🔄 Expanded queries: {expanded_queries}")
 
         all_results = []
+        successful_collections = 0
+        
         for expanded_query in expanded_queries:
             for collection_id in collection_ids:
+                logger.info(f"🔍 Searching collection {collection_id} with query: '{expanded_query}'")
                 vector_store = self.get_vector_store(collection_id)
                 if vector_store:
+                    successful_collections += 1
                     try:
                         # Try different search methods
                         try:
                             results = vector_store.similarity_search_with_relevance_scores(
                                 expanded_query, k=top_k
                             )
-                        except:
+                            logger.info(f"📄 Found {len(results)} results with relevance scores")
+                        except Exception as score_e:
+                            logger.warning(f"⚠️ Relevance scores not supported, trying fallback: {score_e}")
                             # Fallback for older versions
                             results_with_score = vector_store.similarity_search_with_score(
                                 expanded_query, k=top_k
                             )
                             results = [(doc, 1 - score) for doc, score in results_with_score]
+                            logger.info(f"📄 Fallback search found {len(results)} results")
 
                         for doc, score in results:
-                            if score > 0.5:  # Lower threshold for better recall
+                            logger.debug(f"📄 Result score: {score}, content preview: {doc.page_content[:50]}...")
+                            if score > 0.05:  # Lower threshold for better recall (was 0.5, now 0.05)
                                 doc.metadata["collection_id"] = collection_id
                                 doc.metadata["similarity_score"] = float(score)
                                 doc.metadata["matched_query"] = expanded_query
                                 all_results.append((doc, score))
+                                logger.debug(f"✅ Added result with score {score}")
+                            else:
+                                logger.debug(f"⏭️ Skipped result with low score {score}")
                     except Exception as e:
-                        logger.error(f"Search failed for {collection_id}: {str(e)}")
+                        logger.error(f"❌ Search failed for {collection_id}: {str(e)}")
                         continue
+                else:
+                    logger.error(f"❌ Failed to load vector store for {collection_id}")
+
+        logger.info(f"📊 Search summary: {successful_collections}/{len(collection_ids)} collections loaded, {len(all_results)} total results")
 
         # Remove duplicates and sort by score
         unique_results = {}
@@ -192,7 +240,10 @@ class PDFQAProcessor:
                 unique_results[content_hash] = (doc, score)
 
         sorted_results = sorted(unique_results.values(), key=lambda x: x[1], reverse=True)
-        return [doc for doc, score in sorted_results[:config.total_k_results]]
+        final_results = [doc for doc, score in sorted_results[:config.total_k_results]]
+        
+        logger.info(f"🎯 Final results after deduplication: {len(final_results)}")
+        return final_results
 
     def clean_context(self, text: str) -> str:
         """Clean context text to remove noise that confuses the LLM"""
