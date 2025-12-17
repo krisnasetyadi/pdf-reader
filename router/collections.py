@@ -129,21 +129,44 @@ async def serve_pdf_file(collection_id: str, file_name: str):
         
         # Security: prevent path traversal
         if '..' in decoded_file_name or decoded_file_name.startswith('/'):
+            logger.warning(f"🚨 Path traversal attempt: {decoded_file_name}")
             raise HTTPException(status_code=400, detail="Invalid file name")
         
         # Build file path
         file_path = os.path.join(config.upload_folder, collection_id, decoded_file_name)
         
+        # Enhanced logging for debugging
+        logger.info(f"🔍 PDF request - Collection: {collection_id}, File: {decoded_file_name}")
+        logger.info(f"🔍 Looking for file at: {file_path}")
+        logger.info(f"🔍 Upload folder exists: {os.path.exists(config.upload_folder)}")
+        logger.info(f"🔍 Collection folder exists: {os.path.exists(os.path.join(config.upload_folder, collection_id))}")
+        
         # Check if file exists
         if not os.path.exists(file_path):
-            logger.warning(f"File not found: {file_path}")
-            raise HTTPException(status_code=404, detail="File not found")
+            # Enhanced error details for debugging
+            collection_path = os.path.join(config.upload_folder, collection_id)
+            if not os.path.exists(collection_path):
+                logger.error(f"❌ Collection folder not found: {collection_path}")
+                raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found")
+            
+            # List available files in collection for debugging
+            try:
+                available_files = os.listdir(collection_path)
+                logger.error(f"❌ File '{decoded_file_name}' not found in collection '{collection_id}'")
+                logger.error(f"📁 Available files: {available_files}")
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"File '{decoded_file_name}' not found in collection '{collection_id}'. Available files: {', '.join(available_files) if available_files else 'none'}"
+                )
+            except OSError:
+                logger.error(f"❌ Cannot access collection folder: {collection_path}")
+                raise HTTPException(status_code=404, detail=f"Cannot access collection '{collection_id}'")
         
         # Check if it's a PDF
         if not file_path.lower().endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
         
-        logger.info(f"📄 Serving PDF: {file_path}")
+        logger.info(f"✅ Serving PDF: {file_path}")
         
         return FileResponse(
             path=file_path,
