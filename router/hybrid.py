@@ -67,12 +67,14 @@ async def hybrid_query(request: HybridQueryRequest, req: Request):
 
         logger.info(f"PDF: {should_search_pdfs}, DB: {should_search_db}, Chat: {should_search_chat}")
 
-        # Perform hybrid search (now includes chat)
+        # Perform hybrid search with all flags
         hybrid_results = await asyncio.to_thread(
             processor.hybrid_search, 
             request.question, 
             collection_ids,
-            should_search_chat  # Pass include_chat flag
+            should_search_chat,  # include_chat
+            should_search_pdfs,  # include_pdf
+            should_search_db     # include_db
         )
 
         # Generate answer with optional LLM selection

@@ -865,34 +865,47 @@ Answer:"""
         self, 
         question: str, 
         collection_ids: Optional[List[str]] = None,
-        include_chat: bool = True
+        include_chat: bool = True,
+        include_pdf: bool = True,
+        include_db: bool = True
     ) -> Dict[str, Any]:
         """Perform hybrid search across PDF, database, and chat data"""
+        
+        logger.info(f"🔍 Hybrid search flags - PDF: {include_pdf}, DB: {include_db}, Chat: {include_chat}")
 
         analysis = self.analyze_question_type(question)
         search_terms = analysis["search_terms"]
         target_tables = analysis.get("target_tables", [])  # Get smart-routed tables
 
         pdf_docs = []
-        if analysis["is_pdf_question"] or analysis["recommended_type"] == SearchType.HYBRID:
+        if include_pdf and (analysis["is_pdf_question"] or analysis["recommended_type"] == SearchType.HYBRID):
+            logger.info("📄 Searching PDF collections...")
             pdf_docs = self.search_across_collections(
                 question,
                 collection_ids=collection_ids,
                 top_k=config.k_per_collection
             )
+        else:
+            logger.info("⏭️ PDF search skipped (disabled or not relevant)")
 
         db_results = {}
-        if analysis["is_db_question"] or analysis["recommended_type"] == SearchType.HYBRID:
+        if include_db and (analysis["is_db_question"] or analysis["recommended_type"] == SearchType.HYBRID):
+            logger.info("🗄️ Searching database...")
             # Pass target_tables for smart routing
             db_results = self.query_structured_data(search_terms, target_tables)
+        else:
+            logger.info("⏭️ Database search skipped (disabled or not relevant)")
 
-        # NEW: Search chat collections
+        # Search chat collections
         chat_docs = []
         if include_chat:
+            logger.info("💬 Searching chat collections...")
             chat_docs = self.search_across_chat_collections(
                 question,
                 top_k=config.k_per_collection
             )
+        else:
+            logger.info("⏭️ Chat search skipped (disabled)")
 
         return {
             "pdf_documents": pdf_docs,
