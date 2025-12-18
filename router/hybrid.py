@@ -55,17 +55,20 @@ async def hybrid_query(request: HybridQueryRequest, req: Request):
             logger.info(f"Searching in specific collection: {request.collection_id}")
         else:
             collection_ids = processor.get_all_collections()
+            logger.info(f"📚 Found {len(collection_ids)} PDF collections: {collection_ids}")
             if collection_ids:
                 logger.info(f"Searching across {len(collection_ids)} PDF collections")
             else:
-                logger.info("No PDF collections available")
+                logger.warning("⚠️ No PDF collections available - PDF search will be skipped even if requested")
 
         # Check what to search
-        should_search_pdfs = request.include_pdf_results and collection_ids
+        # IMPORTANT: Use bool() to ensure we get True/False, not list/empty-list
+        should_search_pdfs = request.include_pdf_results and bool(collection_ids)
         should_search_db = request.include_db_results
         should_search_chat = request.include_chat_results
 
-        logger.info(f"PDF: {should_search_pdfs}, DB: {should_search_db}, Chat: {should_search_chat}")
+        logger.info(f"🔍 Search flags - PDF: {should_search_pdfs}, DB: {should_search_db}, Chat: {should_search_chat}")
+        logger.info(f"📦 Collections to search: {len(collection_ids) if collection_ids else 0}")
 
         # Perform hybrid search with all flags
         hybrid_results = await asyncio.to_thread(

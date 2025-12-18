@@ -92,6 +92,23 @@ app.include_router(chat_router, prefix="/api/v1")         # Chat upload & collec
 async def root():
     return {"message": "PDF QA API is running", "version": "1.0.0"}
 
+
+@app.get("/api/v1/version")
+async def get_version():
+    """Get backend version and last deployment timestamp"""
+    import sys
+    from datetime import datetime
+    
+    return {
+        "backend": {
+            "version": "1.0.0",
+            "last_updated": "2025-12-18T12:03:56",
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
