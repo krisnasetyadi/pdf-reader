@@ -76,6 +76,11 @@ async def upload_chat(
                 detail="No messages found in chat file. Please check the file format."
             )
         
+        # Extract keywords automatically
+        keywords = parser.extract_keywords(messages, top_n=30)
+        metadata['keywords'] = keywords
+        logger.info(f"🔑 Extracted {len(keywords)} keywords for search boosting")
+        
         # Chunk messages for vectorization
         chunks = parser.chunk_messages_by_conversation(
             messages,
@@ -97,8 +102,12 @@ async def upload_chat(
             created_at=datetime.now()
         )
         
+        # Add keywords to collection metadata
+        collection_dict = collection.model_dump(mode='json')
+        collection_dict['keywords'] = keywords
+        
         # Save metadata to file
-        _save_collection_metadata(collection_id, collection)
+        _save_collection_metadata(collection_id, collection_dict)
         
         logger.info(f"✅ Chat collection created: {collection_id} with {len(messages)} messages")
         
@@ -166,14 +175,14 @@ async def _create_chat_vector_store(
     logger.info(f"💾 Chat vector store saved to: {index_path}")
 
 
-def _save_collection_metadata(collection_id: str, collection: ChatCollection):
+def _save_collection_metadata(collection_id: str, collection: dict):
     """Save collection metadata to JSON file"""
     import json
     
     metadata_path = os.path.join(config.chat_index_folder, collection_id, "metadata.json")
     
     with open(metadata_path, 'w', encoding='utf-8') as f:
-        json.dump(collection.model_dump(mode='json'), f, indent=2, default=str)
+        json.dump(collection, f, indent=2, default=str)
 
 
 @router.get('/chat/collections')
@@ -205,6 +214,7 @@ async def list_chat_collections():
 
 
 @router.delete('/chat/collections/{collection_id}')
+@router.delete('/chat/collection/{collection_id}')  # Alternative path for compatibility
 async def delete_chat_collection(collection_id: str):
     """Delete a chat collection"""
     import shutil

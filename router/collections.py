@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 @router.get("/collections", response_model=List[CollectionInfo])
 async def list_collections():
-    """List available document collections"""
+    """List available PDF document collections"""
     try:
         collections = []
         
@@ -132,14 +132,18 @@ async def serve_pdf_file(collection_id: str, file_name: str):
             logger.warning(f"🚨 Path traversal attempt: {decoded_file_name}")
             raise HTTPException(status_code=400, detail="Invalid file name")
         
-        # Build file path
-        file_path = os.path.join(config.upload_folder, collection_id, decoded_file_name)
+        # Build file path - use absolute path for better compatibility
+        upload_folder_abs = os.path.abspath(config.upload_folder)
+        file_path = os.path.join(upload_folder_abs, collection_id, decoded_file_name)
         
         # Enhanced logging for debugging
         logger.info(f"🔍 PDF request - Collection: {collection_id}, File: {decoded_file_name}")
+        logger.info(f"🔍 CWD: {os.getcwd()}")
+        logger.info(f"🔍 Upload folder (config): {config.upload_folder}")
+        logger.info(f"🔍 Upload folder (absolute): {upload_folder_abs}")
         logger.info(f"🔍 Looking for file at: {file_path}")
-        logger.info(f"🔍 Upload folder exists: {os.path.exists(config.upload_folder)}")
-        logger.info(f"🔍 Collection folder exists: {os.path.exists(os.path.join(config.upload_folder, collection_id))}")
+        logger.info(f"🔍 Upload folder exists: {os.path.exists(upload_folder_abs)}")
+        logger.info(f"🔍 Collection folder exists: {os.path.exists(os.path.join(upload_folder_abs, collection_id))}")
         
         # Check if file exists
         if not os.path.exists(file_path):

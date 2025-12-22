@@ -109,6 +109,62 @@ async def get_version():
     }
 
 
+@app.get("/api/v1/debug/paths")
+async def debug_paths():
+    """Debug endpoint to check file paths and directory structure"""
+    import os
+    
+    def get_collection_info(upload_folder):
+        if not os.path.exists(upload_folder):
+            return {"error": "Upload folder does not exist", "path": upload_folder}
+        
+        collections = []
+        try:
+            for col in os.listdir(upload_folder):
+                col_path = os.path.join(upload_folder, col)
+                if os.path.isdir(col_path):
+                    try:
+                        files = os.listdir(col_path)
+                        file_info = []
+                        for f in files:
+                            fp = os.path.join(col_path, f)
+                            if os.path.isfile(fp):
+                                file_info.append({
+                                    "name": f,
+                                    "size": os.path.getsize(fp),
+                                    "exists": True
+                                })
+                        collections.append({
+                            "id": col,
+                            "files": file_info,
+                            "count": len(file_info)
+                        })
+                    except Exception as e:
+                        collections.append({
+                            "id": col,
+                            "error": str(e)
+                        })
+        except Exception as e:
+            return {"error": f"Cannot list collections: {str(e)}"}
+        
+        return collections
+    
+    return {
+        "cwd": os.getcwd(),
+        "upload_folder": config.upload_folder,
+        "upload_folder_abs": os.path.abspath(config.upload_folder),
+        "upload_folder_exists": os.path.exists(config.upload_folder),
+        "index_folder": config.index_folder,
+        "index_folder_exists": os.path.exists(config.index_folder),
+        "collections": get_collection_info(config.upload_folder),
+        "environment": {
+            "HOME": os.environ.get("HOME", "not set"),
+            "SPACE_ID": os.environ.get("SPACE_ID", "not set (local)"),
+            "USER": os.environ.get("USER", "not set")
+        }
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

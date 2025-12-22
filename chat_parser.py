@@ -7,8 +7,9 @@ Primary focus: WhatsApp TXT format
 import re
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from pathlib import Path
+from collections import Counter
 
 from models import ChatMessage, ChatPlatform
 
@@ -20,6 +21,8 @@ class ChatParser:
     
     # WhatsApp date/time patterns (handles multiple formats)
     WHATSAPP_PATTERNS = [
+        # Format: [YYYY-MM-DD HH:MM:SS] Sender: Message (custom format)
+        r'\[(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\]\s*([^:]+):\s*(.*)',
         # Format: [DD/MM/YYYY, HH:MM:SS] Sender: Message
         r'\[(\d{1,2}/\d{1,2}/\d{2,4}),\s*(\d{1,2}:\d{2}(?::\d{2})?)\]\s*([^:]+):\s*(.*)',
         # Format: DD/MM/YYYY, HH:MM - Sender: Message
@@ -146,6 +149,7 @@ class ChatParser:
         
         # Common date formats
         date_formats = [
+            '%Y-%m-%d',              # YYYY-MM-DD (ISO format)
             '%d/%m/%Y', '%d/%m/%y',  # DD/MM/YYYY or DD/MM/YY
             '%m/%d/%Y', '%m/%d/%y',  # MM/DD/YYYY or MM/DD/YY (US)
             '%Y/%m/%d',              # YYYY/MM/DD
@@ -271,6 +275,66 @@ class ChatParser:
             timestamp_str = msg.timestamp.strftime("%Y-%m-%d %H:%M") if msg.timestamp else ""
             lines.append(f"[{timestamp_str}] {msg.sender}: {msg.content}")
         return "\n".join(lines)
+    
+    def extract_keywords(
+        self, 
+        messages: List[ChatMessage], 
+        top_n: int = 20,
+        min_word_length: int = 3
+    ) -> List[str]:
+        """
+        Extract important keywords from chat messages using frequency analysis
+        
+        Args:
+            messages: List of ChatMessage objects
+            top_n: Number of top keywords to return
+            min_word_length: Minimum length of words to consider
+            
+        Returns:
+            List of important keywords sorted by relevance
+        """
+        # Indonesian stopwords (common words to ignore)
+        stopwords = {
+            'yang', 'dan', 'dari', 'untuk', 'ini', 'itu', 'pada', 'adalah', 'dengan', 'tidak',
+            'ada', 'akan', 'sudah', 'juga', 'atau', 'bisa', 'saya', 'kita', 'kami', 'mereka',
+            'dia', 'pak', 'bu', 'mas', 'mbak', 'bang', 'kak', 'bos', 'gan', 'sis', 'guys',
+            'the', 'is', 'are', 'was', 'were', 'be', 'have', 'has', 'had', 'do', 'does', 'did',
+            'will', 'would', 'should', 'could', 'can', 'may', 'might', 'must', 'shall',
+            'this', 'that', 'these', 'those', 'of', 'to', 'for', 'in', 'on', 'at', 'by', 'with',
+            'a', 'an', 'and', 'or', 'but', 'if', 'then', 'than', 'so', 'very', 'too', 'also'
+        }
+        
+        # Collect all words from messages
+        word_freq = Counter()
+        
+        for msg in messages:
+            # Tokenize content (simple word splitting)
+            words = re.findall(r'\b\w+\b', msg.content.lower())
+            
+            for word in words:
+                # Filter by length and stopwords
+                if (len(word) >= min_word_length and 
+                    word not in stopwords and 
+                    not word.isdigit()):
+                    word_freq[word] += 1
+        
+        # Get participants (important for name-based queries)
+        participants = set()
+        for msg in messages:
+            # Extract first names from sender
+            name_parts = msg.sender.lower().split()
+            participants.update(name_parts)
+        
+        # Boost participant names (they're often important for queries)
+        for name in participants:
+            if name in word_freq:
+                word_freq[name] *= 2  # Double the frequency for names
+        
+        # Get top keywords
+        top_keywords = [word for word, _ in word_freq.most_common(top_n)]
+        
+        logger.info(f"🔑 Extracted {len(top_keywords)} keywords: {top_keywords[:10]}...")
+        return top_keywords
 
 
 # Convenience function

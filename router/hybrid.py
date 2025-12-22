@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 import logging
 import asyncio
+import os
 from datetime import datetime
 from typing import List, Optional
 
@@ -20,6 +21,63 @@ async def get_available_models():
         "default_model": config.model_name,
         "available_models": {provider.value: models for provider, models in AVAILABLE_MODELS.items()},
         "usage_hint": "Send 'llm_provider' and 'llm_model' in your query request to switch models"
+    }
+
+
+@router.get('/collections/all')
+async def get_all_collections_for_query():
+    """Get all available collections (PDF + Chat) for query selection"""
+    import json
+    
+    # Get PDF collections
+    pdf_collections = []
+    if os.path.exists(config.index_folder):
+        for collection_id in os.listdir(config.index_folder):
+            collection_path = os.path.join(config.index_folder, collection_id)
+            if os.path.isdir(collection_path):
+                index_file = os.path.join(collection_path, "index.faiss")
+                if os.path.exists(index_file):
+                    # Get file names from uploads
+                    upload_path = os.path.join(config.upload_folder, collection_id)
+                    files = []
+                    if os.path.exists(upload_path):
+                        files = [f for f in os.listdir(upload_path) if os.path.isfile(os.path.join(upload_path, f))]
+                    
+                    pdf_collections.append({
+                        "collection_id": collection_id,
+                        "type": "pdf",
+                        "file_count": len(files),
+                        "files": files[:5],  # Show first 5 files
+                        "created_at": datetime.fromtimestamp(os.path.getmtime(index_file)).isoformat()
+                    })
+    
+    # Get Chat collections
+    chat_collections = []
+    if os.path.exists(config.chat_index_folder):
+        for collection_id in os.listdir(config.chat_index_folder):
+            collection_path = os.path.join(config.chat_index_folder, collection_id)
+            if os.path.isdir(collection_path):
+                metadata_path = os.path.join(collection_path, "metadata.json")
+                if os.path.exists(metadata_path):
+                    with open(metadata_path, 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                        chat_collections.append({
+                            "collection_id": collection_id,
+                            "type": "chat",
+                            "filename": metadata.get("filename", "Unknown"),
+                            "platform": metadata.get("platform", "unknown"),
+                            "participant_count": metadata.get("participant_count", 0),
+                            "message_count": metadata.get("message_count", 0),
+                            "created_at": metadata.get("created_at", "")
+                        })
+    
+    return {
+        "pdf_collections": pdf_collections,
+        "chat_collections": chat_collections,
+        "total": {
+            "pdf": len(pdf_collections),
+            "chat": len(chat_collections)
+        }
     }
 
 
@@ -50,34 +108,49 @@ async def hybrid_query(request: HybridQueryRequest, req: Request):
             )
 
         # Determine PDF collections to search
-        if request.collection_id:
-            collection_ids = [request.collection_id]
-            logger.info(f"Searching in specific collection: {request.collection_id}")
+        if request.pdf_collection_ids:
+            # Use specific PDF collections
+            pdf_collection_ids = request.pdf_collection_ids
+            logger.info(f"📄 Searching specific PDF collections: {pdf_collection_ids}")
+        elif request.collection_id:
+            # Backward compatibility
+            pdf_collection_ids = [request.collection_id]
+            logger.info(f"📄 Searching in specific collection: {request.collection_id}")
         else:
-            collection_ids = processor.get_all_collections()
-            logger.info(f"📚 Found {len(collection_ids)} PDF collections: {collection_ids}")
-            if collection_ids:
-                logger.info(f"Searching across {len(collection_ids)} PDF collections")
-            else:
-                logger.warning("⚠️ No PDF collections available - PDF search will be skipped even if requested")
+            # Search all PDF collections
+            pdf_collection_ids = processor.get_all_collections()
+            logger.info(f"📚 Found {len(pdf_collection_ids)} PDF collections")
+            if not pdf_collection_ids:
+                logger.warning("⚠️ No PDF collections available")
+        
+        # Determine Chat collections to search
+        if request.chat_collection_ids:
+            # Use specific chat collections
+            chat_collection_ids = request.chat_collection_ids
+            logger.info(f"💬 Searching specific chat collections: {chat_collection_ids}")
+        else:
+            # Search all chat collections
+            chat_collection_ids = processor.get_all_chat_collections()
+            logger.info(f"💬 Found {len(chat_collection_ids)} chat collections")
+            if not chat_collection_ids:
+                logger.warning("⚠️ No chat collections available")
 
         # Check what to search
-        # IMPORTANT: Use bool() to ensure we get True/False, not list/empty-list
-        should_search_pdfs = request.include_pdf_results and bool(collection_ids)
+        should_search_pdfs = request.include_pdf_results and bool(pdf_collection_ids)
         should_search_db = request.include_db_results
-        should_search_chat = request.include_chat_results
+        should_search_chat = request.include_chat_results and bool(chat_collection_ids)
 
-        logger.info(f"🔍 Search flags - PDF: {should_search_pdfs}, DB: {should_search_db}, Chat: {should_search_chat}")
-        logger.info(f"📦 Collections to search: {len(collection_ids) if collection_ids else 0}")
+        logger.info(f"🔍 Search flags - PDF: {should_search_pdfs} ({len(pdf_collection_ids) if pdf_collection_ids else 0} collections), DB: {should_search_db}, Chat: {should_search_chat} ({len(chat_collection_ids) if chat_collection_ids else 0} collections)")
 
-        # Perform hybrid search with all flags
+        # Perform hybrid search with collection selection
         hybrid_results = await asyncio.to_thread(
             processor.hybrid_search, 
             request.question, 
-            collection_ids,
-            should_search_chat,  # include_chat
-            should_search_pdfs,  # include_pdf
-            should_search_db     # include_db
+            pdf_collection_ids,
+            should_search_chat,
+            should_search_pdfs,
+            should_search_db,
+            chat_collection_ids  # Pass chat collections
         )
 
         # Generate answer with optional LLM selection

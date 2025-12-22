@@ -199,31 +199,31 @@ class PDFQAProcessor:
                 if vector_store:
                     successful_collections += 1
                     try:
-                        # Try different search methods
-                        try:
-                            results = vector_store.similarity_search_with_relevance_scores(
-                                expanded_query, k=top_k
-                            )
-                            logger.info(f"📄 Found {len(results)} results with relevance scores")
-                        except Exception as score_e:
-                            logger.warning(f"⚠️ Relevance scores not supported, trying fallback: {score_e}")
-                            # Fallback for older versions
-                            results_with_score = vector_store.similarity_search_with_score(
-                                expanded_query, k=top_k
-                            )
-                            results = [(doc, 1 - score) for doc, score in results_with_score]
-                            logger.info(f"📄 Fallback search found {len(results)} results")
+                        # Use similarity_search_with_score which returns (doc, distance)
+                        # Lower distance = more similar
+                        results_with_score = vector_store.similarity_search_with_score(
+                            expanded_query, k=top_k
+                        )
+                        logger.info(f"📄 Found {len(results_with_score)} results")
 
-                        for doc, score in results:
-                            logger.debug(f"📄 Result score: {score}, content preview: {doc.page_content[:50]}...")
-                            if score > 0.05:  # Lower threshold for better recall (was 0.5, now 0.05)
+                        for doc, distance in results_with_score:
+                            # Convert L2 distance to similarity score (0-1 range)
+                            # Using formula: similarity = 1 / (1 + distance)
+                            # This ensures higher similarity for lower distances
+                            similarity_score = 1.0 / (1.0 + float(distance))
+                            
+                            logger.debug(f"📄 Distance: {distance:.4f}, Similarity: {similarity_score:.4f}, content: {doc.page_content[:50]}...")
+                            
+                            # Accept all results with reasonable similarity (> 0.05)
+                            # For L2 distance, similarity of 0.05 means distance of ~19
+                            if similarity_score > 0.05:
                                 doc.metadata["collection_id"] = collection_id
-                                doc.metadata["similarity_score"] = float(score)
+                                doc.metadata["similarity_score"] = similarity_score
                                 doc.metadata["matched_query"] = expanded_query
-                                all_results.append((doc, score))
-                                logger.debug(f"✅ Added result with score {score}")
+                                all_results.append((doc, similarity_score))
+                                logger.debug(f"✅ Added result with similarity {similarity_score:.4f}")
                             else:
-                                logger.debug(f"⏭️ Skipped result with low score {score}")
+                                logger.debug(f"⏭️ Skipped result with low similarity {similarity_score:.4f}")
                     except Exception as e:
                         logger.error(f"❌ Search failed for {collection_id}: {str(e)}")
                         continue
@@ -397,15 +397,89 @@ Answer:"""
             logger.error(f"Failed to load chat vector store {collection_id}: {e}")
             return None
 
+    def extract_file_reference(self, query: str) -> Optional[str]:
+        """Extract file name reference from query"""
+        import re
+        query_lower = query.lower()
+        
+        # Pattern: "dari file X", "file X", "di X.txt", "tentang X", etc
+        patterns = [
+            r'dari file\s+([\w_-]+)',
+            r'file\s+([\w_-]+)',
+            r'di\s+([\w_-]+\.txt)',
+            r'tentang\s+([\w_-]+)',
+            r'([\w_-]+\.txt)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                file_ref = match.group(1)
+                logger.info(f"📎 Detected file reference in query: {file_ref}")
+                return file_ref
+        
+        return None
+    
+    def _load_collection_keywords(self, collection_id: str) -> List[str]:
+        """Load saved keywords from collection metadata"""
+        import json
+        import os
+        
+        metadata_path = os.path.join(config.chat_index_folder, collection_id, "metadata.json")
+        
+        try:
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                    keywords = metadata.get('keywords', [])
+                    if keywords:
+                        logger.debug(f"📚 Loaded {len(keywords)} keywords for {collection_id}")
+                        return keywords
+        except Exception as e:
+            logger.warning(f"Failed to load keywords for {collection_id}: {e}")
+        
+        return []  # Return empty list if no keywords found
+    
+    def _expand_chat_query(self, query: str) -> List[str]:
+        """Expand query with variations for better chat search"""
+        queries = [query]
+        query_lower = query.lower()
+        
+        # Common Indonesian synonyms/variations for chat context
+        expansions = {
+            'nik': ['nomor induk karyawan', 'employee id', 'id karyawan'],
+            'cuti': ['leave', 'libur', 'off', 'saldo cuti'],
+            'sisa': ['remaining', 'tersisa', 'balance'],
+            'berapa': ['what is', 'jumlah', 'total'],
+            'nama': ['name', 'siapa'],
+            'email': ['alamat email', 'mail'],
+            'telepon': ['phone', 'hp', 'nomor telepon'],
+        }
+        
+        # Add expanded queries
+        for term, synonyms in expansions.items():
+            if term in query_lower:
+                for syn in synonyms[:2]:  # Limit to avoid too many queries
+                    expanded = query_lower.replace(term, syn)
+                    if expanded not in queries:
+                        queries.append(expanded)
+        
+        return queries[:3]  # Limit to 3 queries max
+
     def search_across_chat_collections(
         self, 
         question: str, 
         collection_ids: Optional[List[str]] = None,
-        top_k: int = 3
+        file_filter: Optional[str] = None,
+        top_k: int = 5
     ) -> List:
-        """Search across chat collections"""
+        """Search across chat collections with optional file filtering"""
         if collection_ids is None:
             collection_ids = self.get_all_chat_collections()
+        
+        # Auto-detect file reference if not explicitly provided
+        if file_filter is None:
+            file_filter = self.extract_file_reference(question)
         
         if not collection_ids:
             logger.info("No chat collections available")
@@ -413,30 +487,123 @@ Answer:"""
         
         all_results = []
         
+        # Expand query for better search coverage
+        search_queries = self._expand_chat_query(question)
+        logger.info(f"🔍 Searching with queries: {search_queries}")
+        
         for collection_id in collection_ids:
             vector_store = self.get_chat_vector_store(collection_id)
             if not vector_store:
                 continue
             
             try:
-                results = vector_store.similarity_search_with_relevance_scores(
-                    question, k=top_k
-                )
+                # Search with multiple query variations
+                seen_content_hashes = set()
                 
-                for doc, score in results:
-                    # Only include results above threshold (lowered from 0.3 to 0.05 for better recall)
-                    if score >= 0.05:  # Lower threshold for better recall, same as PDF search
-                        doc.metadata['similarity_score'] = float(score)
-                        doc.metadata['collection_id'] = collection_id
-                        all_results.append(doc)
+                for query in search_queries:
+                    results = vector_store.similarity_search_with_relevance_scores(
+                        query, k=top_k
+                    )
+                    
+                    for doc, score in results:
+                        # Deduplicate by content hash
+                        content_hash = hash(doc.page_content[:100])
+                        if content_hash in seen_content_hashes:
+                            continue
+                        seen_content_hashes.add(content_hash)
+                        
+                        source_file = doc.metadata.get('source', '').lower()
+                        content_lower = doc.page_content.lower()
+                        
+                        # Log all results for debugging
+                        logger.info(f"🔍 Found: {source_file} with score {score:.3f}")
+                        
+                        # Apply file filter if specified
+                        if file_filter and file_filter.lower() not in source_file:
+                            logger.debug(f"⏭️ Skipping {source_file} - doesn't match filter: {file_filter}")
+                            continue
+                        
+                        # Multi-level boosting strategy
+                        boosted_score = score
+                        boost_reasons = []
+                        
+                        # 1. Filename matching boost
+                        if file_filter and file_filter.lower() in source_file:
+                            boosted_score *= 1.8
+                            boost_reasons.append("filename_match")
+                        
+                        # 2. Load saved keywords from metadata (dynamic!)
+                        saved_keywords = self._load_collection_keywords(collection_id)
+                        
+                        # 3. Content keyword matching boost (use saved keywords dynamically)
+                        question_lower = question.lower()
+                        question_words = set(question_lower.split())
+                        
+                        # Check for keywords match
+                        keyword_matches = 0
+                        matched_keywords = []
+                        
+                        for keyword in saved_keywords:
+                            if keyword in question_lower and keyword in content_lower:
+                                keyword_matches += 1
+                                matched_keywords.append(keyword)
+                        
+                        # Boost based on keyword density
+                        if keyword_matches >= 2:
+                            keyword_boost = 1.5
+                            boosted_score *= keyword_boost
+                            boost_reasons.append(f"{keyword_matches}_keywords[{','.join(matched_keywords[:3])}]")
+                            logger.info(f"🎯 Keyword boost for {source_file}: {keyword_matches} matches ({matched_keywords[:5]})")
+                        
+                        if boost_reasons:
+                            logger.info(f"⬆️ Boosted score for {source_file}: {score:.3f} → {boosted_score:.3f} ({', '.join(boost_reasons)})")
+                        
+                        # Use VERY low threshold since FAISS relevance scores can be negative
+                        # The key is to compare relative scores, not absolute values
+                        threshold = 0.0 if file_filter else 0.05  # Allow negative scores with filtering
+                        
+                        if boosted_score >= threshold or (file_filter and file_filter.lower() in source_file):
+                            # If file filter matches, always include regardless of score
+                            doc.metadata['similarity_score'] = float(boosted_score)
+                            doc.metadata['original_score'] = float(score)
+                            doc.metadata['collection_id'] = collection_id
+                            all_results.append(doc)
+                            logger.info(f"✅ Added {source_file} (score: {boosted_score:.3f})")
+                        else:
+                            logger.debug(f"⏭️ Skipped {source_file} with score {boosted_score:.3f} < {threshold}")
                         
             except Exception as e:
                 logger.error(f"Error searching chat collection {collection_id}: {e}")
                 continue
         
-        # Sort by score and return top results
+        # Re-rank results based on keyword content match with query
+        question_lower = question.lower()
+        question_words = set(question_lower.split())
+        
+        for doc in all_results:
+            content_lower = doc.page_content.lower()
+            
+            # Count how many query words appear in content
+            word_matches = sum(1 for word in question_words if word in content_lower and len(word) > 2)
+            
+            # Boost score based on keyword overlap
+            current_score = doc.metadata.get('similarity_score', 0)
+            content_boost = 1 + (word_matches * 0.2)  # 20% boost per matching word
+            doc.metadata['similarity_score'] = current_score * content_boost
+            doc.metadata['keyword_matches'] = word_matches
+            
+            if word_matches > 0:
+                logger.info(f"📝 Content re-rank for {doc.metadata.get('source', '')}: {word_matches} word matches, score: {current_score:.3f} → {doc.metadata['similarity_score']:.3f}")
+        
+        # Sort by updated score
         all_results.sort(key=lambda x: x.metadata.get('similarity_score', 0), reverse=True)
-        logger.info(f"📱 Found {len(all_results)} chat results")
+        
+        filter_info = f" (filtered by: {file_filter})" if file_filter else ""
+        logger.info(f"📱 Found {len(all_results)} chat results{filter_info}")
+        
+        if file_filter and len(all_results) == 0:
+            logger.warning(f"⚠️ No results found with file filter '{file_filter}'. Try broader search.")
+        
         return all_results[:top_k * 2]  # Return more context for chats
 
     def invalidate_cache(self, collection_id=None):
@@ -867,9 +1034,10 @@ Answer:"""
         collection_ids: Optional[List[str]] = None,
         include_chat: bool = True,
         include_pdf: bool = True,
-        include_db: bool = True
+        include_db: bool = True,
+        chat_collection_ids: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        """Perform hybrid search across PDF, database, and chat data"""
+        """Perform hybrid search across PDF, database, and chat data with collection selection"""
         
         logger.info(f"🔍 Hybrid search flags - PDF: {include_pdf}, DB: {include_db}, Chat: {include_chat}")
 
@@ -878,30 +1046,40 @@ Answer:"""
         target_tables = analysis.get("target_tables", [])  # Get smart-routed tables
 
         pdf_docs = []
-        if include_pdf and (analysis["is_pdf_question"] or analysis["recommended_type"] == SearchType.HYBRID):
-            logger.info("📄 Searching PDF collections...")
+        # FIXED: When user explicitly enables PDF search via include_pdf=True,
+        # always search PDFs regardless of question type analysis
+        if include_pdf:
+            logger.info("📄 Searching PDF collections (explicitly enabled)...")
             pdf_docs = self.search_across_collections(
                 question,
                 collection_ids=collection_ids,
                 top_k=config.k_per_collection
             )
         else:
-            logger.info("⏭️ PDF search skipped (disabled or not relevant)")
+            logger.info("⏭️ PDF search skipped (disabled by user)")
 
         db_results = {}
-        if include_db and (analysis["is_db_question"] or analysis["recommended_type"] == SearchType.HYBRID):
+        # FIXED: When user explicitly enables DB search, always search DB
+        if include_db:
             logger.info("🗄️ Searching database...")
             # Pass target_tables for smart routing
             db_results = self.query_structured_data(search_terms, target_tables)
         else:
             logger.info("⏭️ Database search skipped (disabled or not relevant)")
 
-        # Search chat collections
+        # Search chat collections with collection selection
         chat_docs = []
         if include_chat:
             logger.info("💬 Searching chat collections...")
+            # Auto-detect file reference from question
+            file_filter = self.extract_file_reference(question)
+            if file_filter:
+                logger.info(f"🎯 File filter detected: {file_filter}")
+            
             chat_docs = self.search_across_chat_collections(
                 question,
+                collection_ids=chat_collection_ids,  # Use specific chat collections
+                file_filter=file_filter,
                 top_k=config.k_per_collection
             )
         else:
@@ -983,21 +1161,34 @@ Answer:"""
    
         if has_chat_results:
             context_parts.append("\nINFORMASI DARI CHAT LOGS:")
-            for i, doc in enumerate(chat_docs[:3]):  # limit to top 3 chat results
+            
+            # Prioritize chunks that contain query keywords in content
+            question_lower = question.lower()
+            query_words = [w for w in question_lower.split() if len(w) > 2]
+            
+            # Re-sort chat docs by keyword relevance to answer the specific question
+            def keyword_priority(doc):
+                content = doc.page_content.lower()
+                matches = sum(1 for word in query_words if word in content)
+                return (matches, doc.metadata.get('similarity_score', 0))
+            
+            sorted_chat_docs = sorted(chat_docs, key=keyword_priority, reverse=True)
+            
+            # Take top 5 chat results for more context
+            for i, doc in enumerate(sorted_chat_docs[:5]):
                 source = doc.metadata.get('source', 'Unknown')
                 platform = doc.metadata.get('platform', 'unknown')
                 participants = doc.metadata.get('participants', '')
                 score = doc.metadata.get('similarity_score', 0)
                 time_start = doc.metadata.get('time_range_start', '')
                 
-                truncated_content = self.truncate_context(doc.page_content, max_tokens=200)
-                context_parts.append(f"[Chat: {source}, Platform: {platform}, Relevansi: {score:.2f}]")
-                if participants:
-                    context_parts.append(f"Peserta: {participants}")
+                # Increase token limit for chat to capture more context
+                truncated_content = self.truncate_context(doc.page_content, max_tokens=400)
+                context_parts.append(f"[Sumber: {source}]")
                 context_parts.append(f"{truncated_content}\n")
 
         context = "\n".join(context_parts)
-        context = self.truncate_context(context, max_tokens=400)  # Reduced for flan-t5 context limit
+        context = self.truncate_context(context, max_tokens=900)  # Increased for better chat context
 
         # Extract main keyword from question for focused answering
         question_lower = question.lower()
@@ -1019,8 +1210,18 @@ Pertanyaan: {question}
 Jawaban tentang {keyword}:"""
             prompt = prompt_template.format(keyword=main_keyword, context=context, question=question)
         else:
+            # Check if this is primarily a chat question
+            if has_chat_results and not has_pdf_results and not has_db_results:
+                prompt_template = """Ekstrak informasi yang diminta dari percakapan chat berikut. Berikan jawaban yang spesifik dan langsung.
+
+Percakapan:
+{context}
+
+Pertanyaan: {question}
+
+Jawaban (langsung dan spesifik):"""
             # Check if this is primarily a database question
-            if has_db_results and not has_pdf_results:
+            elif has_db_results and not has_pdf_results:
                 prompt_template = """Berdasarkan data berikut, jawab pertanyaan dengan format yang jelas dan informatif.
 
 Data:

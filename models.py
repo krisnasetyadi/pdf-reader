@@ -78,7 +78,12 @@ class PdfSourceInfo(BaseModel):
 # models.py - Add these fields to HybridQueryRequest
 class HybridQueryRequest(BaseModel):
     question: str
-    collection_id: Optional[str] = None
+    collection_id: Optional[str] = None  # DEPRECATED: use pdf_collection_ids instead
+    
+    # Collection Selection (Optional - if not provided, searches all)
+    pdf_collection_ids: Optional[List[str]] = None  # Specific PDF collections to search
+    chat_collection_ids: Optional[List[str]] = None  # Specific chat collections to search
+    
     include_pdf_results: bool = True
     include_db_results: bool = True
     include_chat_results: bool = True  # NEW: Search in chat logs?
