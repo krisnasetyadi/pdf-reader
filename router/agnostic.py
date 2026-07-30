@@ -14,11 +14,13 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
 from pydantic import BaseModel, Field
 
 from config import config
 from processor import processor
+import storage as supabase_storage
+from router.auth import get_current_user, UserRecord
 from router.public_links import resolve_active_public_link_sources
 from router.database_connections import resolve_active_database_connections
 
@@ -102,34 +104,51 @@ def _describe_source_type(has_public_links: bool, has_external_db: bool) -> str:
 
 
 @router.post("/agnostic/query", response_model=AgnosticQueryResponse)
-async def agnostic_query(req: AgnosticQueryRequest, request: Request):
+async def agnostic_query(
+    req: AgnosticQueryRequest,
+    request: Request,
+    user: UserRecord = Depends(get_current_user),
+):
     start_time = datetime.now()
-    logger.info("agnostic_query: question=%r", req.question)
+    logger.info("agnostic_query: question=%r user=%s", req.question, user.user_id)
     base_url = str(request.base_url).rstrip('/')
+    is_admin = user.role == "admin"
 
     try:
-        # Resolve collections
-        pdf_collection_ids = req.pdf_collection_ids
-        if not pdf_collection_ids and req.include_pdf_results:
-            pdf_collection_ids = processor.get_all_collections()
-            logger.info("agnostic_query: %d PDF collection(s) available", len(pdf_collection_ids or []))
+        # Resolve collections — scoped to what this user is allowed to see.
+        # Admins can reach every PDF collection; everyone else only their own.
+        allowed_pdf_ids = set(await asyncio.to_thread(
+            supabase_storage.list_collection_ids_for_user, user.user_id, is_admin
+        ))
+        if req.pdf_collection_ids:
+            pdf_collection_ids = [cid for cid in req.pdf_collection_ids if cid in allowed_pdf_ids]
+        elif req.include_pdf_results:
+            pdf_collection_ids = list(allowed_pdf_ids)
+        else:
+            pdf_collection_ids = []
+        logger.info("agnostic_query: %d PDF collection(s) accessible to user", len(pdf_collection_ids))
 
-        chat_collection_ids = req.chat_collection_ids
-        if not chat_collection_ids and req.include_chat_results:
+        # Chat is admin-only (business rule — non-admins never search it,
+        # regardless of what flags/ids the client sends).
+        chat_collection_ids = req.chat_collection_ids if is_admin else []
+        if is_admin and not chat_collection_ids and req.include_chat_results:
             chat_collection_ids = processor.get_all_chat_collections()
 
         should_search_pdfs = bool(req.include_pdf_results) and bool(pdf_collection_ids)
         should_search_db   = bool(req.include_db_results)
-        should_search_chat = bool(req.include_chat_results) and bool(chat_collection_ids)
+        should_search_chat = is_admin and bool(req.include_chat_results) and bool(chat_collection_ids)
         public_link_sources: List[Dict[str, Any]] = []
         if bool(req.include_public_links):
-            public_link_sources = await resolve_active_public_link_sources(req.public_link_ids)
+            public_link_sources = await resolve_active_public_link_sources(
+                req.public_link_ids, user_id=user.user_id, is_admin=is_admin
+            )
         should_search_public_links = bool(req.include_public_links) and bool(public_link_sources)
 
+        # Database connections are admin-only (business rule), same as chat.
         external_db_connections: List[Dict[str, Any]] = []
-        if bool(req.include_external_db):
+        if is_admin and bool(req.include_external_db):
             external_db_connections = await resolve_active_database_connections(req.external_db_connection_ids)
-        should_search_external_db = bool(req.include_external_db) and bool(external_db_connections)
+        should_search_external_db = is_admin and bool(req.include_external_db) and bool(external_db_connections)
 
         # Run hybrid search against pre-built FAISS indexes
         hybrid_results = await asyncio.to_thread(

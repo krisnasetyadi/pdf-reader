@@ -1,10 +1,12 @@
 # router/upload.py
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Depends
 from typing import List, Optional, Literal
+import asyncio
 import os
 import shutil
 import uuid
 import re
+from router.auth import get_current_user, UserRecord
 from html import unescape
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -12,6 +14,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 from utils import process_pdfs
+from ssrf_guard import assert_public_url_safe
 from models import (
     DriveFolderItem,
     DriveFolderItemsResponse,
@@ -187,6 +190,7 @@ def _normalize_title(candidate: Optional[str]) -> Optional[str]:
 
 
 async def _download_remote_pdf(source_url: str, destination_path: str) -> tuple[str, str]:
+    assert_public_url_safe(source_url)
     timeout = httpx.Timeout(60.0, connect=20.0)
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
         async with client.stream(
@@ -240,6 +244,7 @@ def _register_uploaded_collection(
     chunk_count: int,
     title: Optional[str] = None,
     persist_mode: Literal["auto", "local", "database"] = "auto",
+    owner_id: Optional[str] = None,
 ):
     if persist_mode == "local":
         logger.info("Persist mode=local — skipping Supabase upload and DB registration")
@@ -274,6 +279,7 @@ def _register_uploaded_collection(
             chunk_count=chunk_count,
             title=title,
             storage_paths=storage_paths,
+            owner_id=owner_id,
         )
         logger.info("Collection %s registered in Supabase DB", collection_id)
     elif persist_mode == "database":
@@ -297,7 +303,10 @@ def _cleanup_local_artifacts(collection_id: str, collection_path: str):
 
 
 @router.post("/drive/folder-items", response_model=DriveFolderItemsResponse)
-async def list_drive_folder_items(payload: DriveFolderRequest):
+async def list_drive_folder_items(
+    payload: DriveFolderRequest,
+    user: UserRecord = Depends(get_current_user),
+):
     folder_url = payload.url.strip()
     if not folder_url:
         raise HTTPException(status_code=400, detail="URL is required")
@@ -361,6 +370,7 @@ async def upload_pdfs(
         "auto",
         description="Persistence mode: auto (default), local (disk only), database (require DATABASE_URL)",
     ),
+    user: UserRecord = Depends(get_current_user),
 ):
     """Upload and process PDF files, then persist to Supabase Storage."""
     if not files:
@@ -388,7 +398,7 @@ async def upload_pdfs(
             status_code=400, detail="No valid PDF files uploaded")
 
     try:
-        chunk_count = process_pdfs(saved_files, collection_id)
+        chunk_count = await asyncio.to_thread(process_pdfs, saved_files, collection_id)
     except Exception as e:
         shutil.rmtree(collection_path, ignore_errors=True)
         logger.error(f"Upload failed: {str(e)}")
@@ -400,6 +410,7 @@ async def upload_pdfs(
         file_names,
         chunk_count,
         persist_mode=persist_mode,
+        owner_id=user.user_id,
     )
 
     if persist_mode == "database":
@@ -420,6 +431,7 @@ async def upload_pdf_from_url(
         "auto",
         description="Persistence mode: auto (default), local (disk only), database (require DATABASE_URL)",
     ),
+    user: UserRecord = Depends(get_current_user),
 ):
     """Download a public PDF from a remote URL (including Google Drive public links) and process it as a collection."""
     source_url = payload.url.strip()
@@ -440,7 +452,7 @@ async def upload_pdf_from_url(
             fallback_name,
         )
 
-        chunk_count = process_pdfs([final_path], collection_id)
+        chunk_count = await asyncio.to_thread(process_pdfs, [final_path], collection_id)
         if chunk_count <= 0:
             raise HTTPException(status_code=400, detail="No readable text was found in the PDF")
 
@@ -451,6 +463,7 @@ async def upload_pdf_from_url(
             chunk_count,
             title=collection_title,
             persist_mode=persist_mode,
+            owner_id=user.user_id,
         )
 
         if persist_mode == "database":
@@ -486,6 +499,7 @@ async def upload_pdfs_from_urls(
         "auto",
         description="Persistence mode: auto (default), local (disk only), database (require DATABASE_URL)",
     ),
+    user: UserRecord = Depends(get_current_user),
 ):
     urls = [item.strip() for item in (payload.urls or []) if item and item.strip()]
     if not urls:
@@ -520,7 +534,7 @@ async def upload_pdfs_from_urls(
             failure_message = failures[0] if failures else "Unable to download selected files"
             raise HTTPException(status_code=400, detail=f"No valid PDF files imported: {failure_message}")
 
-        chunk_count = process_pdfs(saved_files, collection_id)
+        chunk_count = await asyncio.to_thread(process_pdfs, saved_files, collection_id)
         if chunk_count <= 0:
             raise HTTPException(status_code=400, detail="No readable text was found in the selected PDFs")
 
@@ -531,6 +545,7 @@ async def upload_pdfs_from_urls(
             chunk_count,
             title=collection_title,
             persist_mode=persist_mode,
+            owner_id=user.user_id,
         )
 
         if persist_mode == "database":

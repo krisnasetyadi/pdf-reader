@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('router/public_links.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('router/chat.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(rm -f mofids-group-raw.txt mofids-personal-message.txt mofids-smaller-group.txt)",
+      "Bash(rm -rf .mypy_cache __pycache__ agnostic/__pycache__ router/__pycache__)",
+      "Bash(rm -f uvicorn_err2.log uvicorn_out2.log)",
+      "Read(//c/Users/RentalWorks-D5CKVT2/Documents/PDFREADER/**)",
+      "Bash(cp pdf-reader/storage.py hf-doculens-api/storage.py)",
+      "Bash(cp pdf-reader/router/upload.py hf-doculens-api/router/upload.py)",
+      "Bash(cp pdf-reader/router/collections.py hf-doculens-api/router/collections.py)",
+      "Bash(cp pdf-reader/router/database_connections.py hf-doculens-api/router/database_connections.py)"
+    ]
+  }
+}

@@ -91,8 +91,12 @@ def ensure_schema():
                     ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';
                 ALTER TABLE pdf_collections
                     ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+                ALTER TABLE pdf_collections
+                    ADD COLUMN IF NOT EXISTS owner_id TEXT;
                 CREATE INDEX IF NOT EXISTS idx_pdf_collections_cid
                     ON pdf_collections (collection_id);
+                CREATE INDEX IF NOT EXISTS idx_pdf_collections_owner
+                    ON pdf_collections (owner_id);
                 CREATE INDEX IF NOT EXISTS idx_pdf_collections_created
                     ON pdf_collections (created_at DESC);
 
@@ -127,10 +131,14 @@ def ensure_schema():
                     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
+                ALTER TABLE chat_sessions
+                    ADD COLUMN IF NOT EXISTS owner_id TEXT;
                 CREATE INDEX IF NOT EXISTS idx_chat_sessions_sid
                     ON chat_sessions (session_id);
                 CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated
                     ON chat_sessions (updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_chat_sessions_owner
+                    ON chat_sessions (owner_id);
 
                 CREATE TABLE IF NOT EXISTS chat_messages (
                     id          BIGSERIAL   PRIMARY KEY,
@@ -476,6 +484,7 @@ def register_collection(
     chunk_count: int,
     title: Optional[str] = None,
     storage_paths: Optional[List[str]] = None,
+    owner_id: Optional[str] = None,
 ) -> bool:
     ensure_schema()
     logger.info("register_collection: collection_id=%s, has_db=%s", collection_id, has_database())
@@ -487,15 +496,16 @@ def register_collection(
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO pdf_collections
-                    (collection_id, title, file_names, chunk_count, storage_paths)
-                VALUES (%s, %s, %s, %s, %s)
+                    (collection_id, title, file_names, chunk_count, storage_paths, owner_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (collection_id) DO UPDATE SET
                     title         = EXCLUDED.title,
                     file_names    = EXCLUDED.file_names,
                     chunk_count   = EXCLUDED.chunk_count,
                     storage_paths = EXCLUDED.storage_paths,
+                    owner_id      = COALESCE(EXCLUDED.owner_id, pdf_collections.owner_id),
                     updated_at    = now()
-            """, (collection_id, title or "", file_names, chunk_count, storage_paths or []))
+            """, (collection_id, title or "", file_names, chunk_count, storage_paths or [], owner_id))
         conn.close()
         logger.info("Registered PDF collection: %s", collection_id)
         return True
@@ -545,7 +555,7 @@ def list_collections() -> List[Dict[str, Any]]:
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT collection_id, title, file_names, chunk_count, storage_paths, status, created_at, updated_at
+                SELECT collection_id, title, file_names, chunk_count, storage_paths, status, owner_id, created_at, updated_at
                 FROM pdf_collections ORDER BY created_at DESC
             """)
             rows = cur.fetchall()
@@ -564,7 +574,7 @@ def get_collection(collection_id: str) -> Optional[Dict[str, Any]]:
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT collection_id, title, file_names, chunk_count, storage_paths, status, created_at, updated_at
+                SELECT collection_id, title, file_names, chunk_count, storage_paths, status, owner_id, created_at, updated_at
                 FROM pdf_collections WHERE collection_id = %s
             """, (collection_id,))
             row = cur.fetchone()
@@ -573,6 +583,30 @@ def get_collection(collection_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.warning("get_collection failed for %s: %s", collection_id, e)
         return None
+
+
+def list_collection_ids_for_user(user_id: str, is_admin: bool) -> List[str]:
+    """Collection IDs a given user is allowed to see: all of them for admins,
+    only their own (owner_id match) for everyone else."""
+    ensure_schema()
+    conn = _db_conn()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            if is_admin:
+                cur.execute("SELECT collection_id FROM pdf_collections")
+            else:
+                cur.execute(
+                    "SELECT collection_id FROM pdf_collections WHERE owner_id = %s",
+                    (user_id,),
+                )
+            rows = cur.fetchall()
+        conn.close()
+        return [r["collection_id"] for r in rows]
+    except Exception as e:
+        logger.warning("list_collection_ids_for_user failed: %s", e)
+        return []
 
 
 def set_collection_status(collection_id: str, active: bool) -> bool:

@@ -162,6 +162,7 @@ class CollectionInfo(BaseModel):
     file_names: List[str]
     title: Optional[str] = None
     status: str = "active"
+    owner_id: Optional[str] = None
 
 
 class SetPdfCollectionActiveRequest(BaseModel):

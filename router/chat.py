@@ -4,7 +4,7 @@ Chat logs upload and search endpoints
 Handles WhatsApp TXT file uploads and indexing to FAISS
 """
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query, Depends
 import logging
 import os
 import uuid
@@ -17,6 +17,7 @@ from config import config
 from models import ChatUploadResponse, ChatPlatform, ChatCollection, SetChatCollectionActiveRequest
 from chat_parser import ChatParser
 from processor import processor
+from router.auth import require_role, UserRecord
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -25,7 +26,8 @@ logger = logging.getLogger(__name__)
 @router.post('/chat/upload', response_model=ChatUploadResponse)
 async def upload_chat(
     file: UploadFile = File(...),
-    platform: str = Form(default="whatsapp")
+    platform: str = Form(default="whatsapp"),
+    _: UserRecord = Depends(require_role("admin")),
 ):
     """
     Upload and process a chat export file
@@ -207,7 +209,7 @@ def _save_collection_metadata(collection_id: str, collection: dict):
 
 
 @router.get('/chat/collections')
-async def list_chat_collections():
+async def list_chat_collections(_: UserRecord = Depends(require_role("admin"))):
     """List all available chat collections"""
     # Query Supabase DB first
     if supabase_storage.has_database():
@@ -243,6 +245,7 @@ async def list_chat_collections():
 async def preview_chat_collection(
     collection_id: str,
     max_chars: int = Query(default=20000, ge=500, le=200000),
+    _: UserRecord = Depends(require_role("admin")),
 ):
     """Return plain-text preview content from an uploaded chat collection file."""
     collection_info = None
@@ -303,7 +306,10 @@ async def preview_chat_collection(
 
 
 @router.post('/chat-collection/activate')
-async def set_chat_collection_active(body: SetChatCollectionActiveRequest):
+async def set_chat_collection_active(
+    body: SetChatCollectionActiveRequest,
+    _: UserRecord = Depends(require_role("admin")),
+):
     """Toggle a chat collection's active status (used as a knowledge source)."""
     if not supabase_storage.is_enabled() and not supabase_storage.has_database():
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -315,7 +321,10 @@ async def set_chat_collection_active(body: SetChatCollectionActiveRequest):
 
 @router.delete('/chat/collections/{collection_id}')
 @router.delete('/chat/collection/{collection_id}')  # Alternative path for compatibility
-async def delete_chat_collection(collection_id: str):
+async def delete_chat_collection(
+    collection_id: str,
+    _: UserRecord = Depends(require_role("admin")),
+):
     """Delete a chat collection"""
     import shutil
     

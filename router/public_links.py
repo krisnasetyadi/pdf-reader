@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends
 from urllib.parse import parse_qs, unquote, urlparse
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timezone
@@ -11,6 +11,8 @@ import re
 from html import unescape
 import httpx
 from config import config
+from ssrf_guard import assert_public_url_safe
+from router.auth import get_current_user, UserRecord
 
 from models import (
     CreatePublicLinkRequest,
@@ -25,15 +27,6 @@ logger = logging.getLogger(__name__)
 
 _tables_ensured = False
 GOOGLE_DRIVE_HOSTS = {"drive.google.com", "docs.google.com"}
-
-
-def _public_links_user_id() -> str:
-    return os.getenv("PUBLIC_LINKS_USER_ID", os.getenv("DEV_USER_ID", "public-links-local-user"))
-
-
-def _enforce_scope() -> bool:
-    raw = os.getenv("PUBLIC_LINKS_ENFORCE_SCOPE", "false")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _database_url() -> str | None:
@@ -206,8 +199,8 @@ def _replace_items(cur, link_id: str, items: List[Dict[str, str]]) -> None:
         )
 
 
-def _fetch_link_detail(cur, link_id: str, user_id: str) -> Dict[str, Any] | None:
-    if _enforce_scope():
+def _fetch_link_detail(cur, link_id: str, user_id: str, is_admin: bool = False) -> Dict[str, Any] | None:
+    if not is_admin:
         cur.execute(
             """
             SELECT link_id, workspace_id, title, url, status, created_at
@@ -341,8 +334,8 @@ def _ensure_tables(conn) -> None:
         raise HTTPException(status_code=500, detail="Failed to initialize public links schema")
 
 
-def _fetch_links(cur, user_id: str) -> List[Dict[str, Any]]:
-    if _enforce_scope():
+def _fetch_links(cur, user_id: str, is_admin: bool = False) -> List[Dict[str, Any]]:
+    if not is_admin:
         cur.execute(
             """
             SELECT link_id, workspace_id, title, url, status, created_at
@@ -476,6 +469,8 @@ async def _resolve_runtime_items(
 
 async def resolve_active_public_link_sources(
     link_ids: Optional[List[str]] = None,
+    user_id: Optional[str] = None,
+    is_admin: bool = False,
 ) -> List[Dict[str, Any]]:
     conn = _get_conn()
     if not conn:
@@ -486,7 +481,7 @@ async def resolve_active_public_link_sources(
 
     try:
         with conn.cursor() as cur:
-            raw_links = _fetch_links(cur, _public_links_user_id())
+            raw_links = _fetch_links(cur, user_id or "", is_admin)
     finally:
         conn.close()
 
@@ -524,7 +519,7 @@ async def resolve_active_public_link_sources(
 
 
 @router.get("/public-links", response_model=PublicLinksResponse)
-async def list_public_links():
+async def list_public_links(user: UserRecord = Depends(get_current_user)):
     conn = _get_conn()
     if not conn:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -532,7 +527,7 @@ async def list_public_links():
     _ensure_tables(conn)
     try:
         with conn.cursor() as cur:
-            raw_links = _fetch_links(cur, _public_links_user_id())
+            raw_links = _fetch_links(cur, user.user_id, user.role == "admin")
         links = [_as_public_link_source(entry) for entry in raw_links]
         return PublicLinksResponse(links=links, count=len(links))
     except Exception as exc:
@@ -545,8 +540,10 @@ async def list_public_links():
 @router.post("/public-links", response_model=PublicLinkSource, status_code=status.HTTP_201_CREATED)
 async def create_public_link(
     body: CreatePublicLinkRequest,
+    user: UserRecord = Depends(get_current_user),
 ):
     _validate_url(body.url)
+    assert_public_url_safe(body.url)
 
     conn = _get_conn()
     if not conn:
@@ -579,13 +576,14 @@ async def create_public_link(
                 VALUES (%s, %s, %s, %s, %s, 'active')
                 RETURNING link_id, workspace_id, title, url, status, created_at
                 """,
-                (link_id, _public_links_user_id(), None, title, body.url),
+                (link_id, user.user_id, None, title, body.url),
             )
             row = cur.fetchone()
 
             dedup: Dict[str, Dict[str, str]] = {}
             for item in extracted_items:
                 _validate_url(item["url"])
+                assert_public_url_safe(item["url"])
                 dedup[item["url"]] = item
             _replace_items(cur, link_id, list(dedup.values()))
 
@@ -628,6 +626,7 @@ async def create_public_link(
 @router.post("/public-link/activate")
 async def set_public_link_active(
     body: SetPublicLinkActiveRequest,
+    user: UserRecord = Depends(get_current_user),
 ):
     conn = _get_conn()
     if not conn:
@@ -637,7 +636,7 @@ async def set_public_link_active(
 
     try:
         with conn.cursor() as cur:
-            if _enforce_scope():
+            if user.role != "admin":
                 cur.execute(
                     """
                     UPDATE public_links
@@ -645,7 +644,7 @@ async def set_public_link_active(
                     WHERE link_id = %s AND user_id = %s
                     RETURNING link_id
                     """,
-                    ("active" if body.active else "inactive", body.link_id, _public_links_user_id()),
+                    ("active" if body.active else "inactive", body.link_id, user.user_id),
                 )
             else:
                 cur.execute(
@@ -673,7 +672,7 @@ async def set_public_link_active(
 
 
 @router.delete("/public-link/{link_id}")
-async def delete_public_link(link_id: str):
+async def delete_public_link(link_id: str, user: UserRecord = Depends(get_current_user)):
     conn = _get_conn()
     if not conn:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -682,14 +681,14 @@ async def delete_public_link(link_id: str):
 
     try:
         with conn.cursor() as cur:
-            if _enforce_scope():
+            if user.role != "admin":
                 cur.execute(
                     """
                     DELETE FROM public_links
                     WHERE link_id = %s AND user_id = %s
                     RETURNING link_id
                     """,
-                    (link_id, _public_links_user_id()),
+                    (link_id, user.user_id),
                 )
             else:
                 cur.execute(

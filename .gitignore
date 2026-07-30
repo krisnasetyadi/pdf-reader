@@ -2,4 +2,24 @@ __pycache__/
 *.py[cod]
 .env
 .env.example
-mofids*
+*mofids*
+
+# virtualenvs / caches
+venv/
+source/
+.mypy_cache/
+
+# runtime data (uploads, indices) - generated, not source
+data/uploads/*
+data/indices/*
+data/chat_indices/*
+data/processed_chats/*
+!data/uploads/.gitkeep
+!data/indices/.gitkeep
+!data/chat_indices/.gitkeep
+!data/processed_chats/.gitkeep
+
+# local logs
+*.log
+
+.PRICING_COST_MODEL.md

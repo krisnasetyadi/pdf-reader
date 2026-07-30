@@ -12,6 +12,7 @@ from langchain_community.vectorstores import FAISS
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import torch
 import os
 import re
@@ -303,16 +304,20 @@ class PDFQAProcessor:
         successful_collections = 0
         
         for expanded_query in expanded_queries:
+            # Embed the query text once per expansion variant instead of once
+            # per (expansion x collection) pair — the embedding is identical
+            # across collections, only the vector store being searched differs.
+            query_vector = self.embeddings.embed_query(expanded_query)
             for collection_id in collection_ids:
                 logger.info(f"🔍 Searching collection {collection_id} with query: '{expanded_query}'")
                 vector_store = self.get_vector_store(collection_id)
                 if vector_store:
                     successful_collections += 1
                     try:
-                        # Use similarity_search_with_score which returns (doc, distance)
+                        # Use similarity_search_with_score_by_vector which returns (doc, distance)
                         # Lower distance = more similar
-                        results_with_score = vector_store.similarity_search_with_score(
-                            expanded_query, k=top_k
+                        results_with_score = vector_store.similarity_search_with_score_by_vector(
+                            query_vector, k=top_k
                         )
                         logger.info(f"📄 Found {len(results_with_score)} results")
 
@@ -687,20 +692,26 @@ Answer:"""
         search_queries = self._expand_chat_query(question)
         logger.info(f"🔍 Searching with queries: {search_queries}")
         
+        # Embed each query variant once and reuse the vector across all
+        # collections, instead of re-embedding the same text per collection.
+        query_vectors = [(query, self.embeddings.embed_query(query)) for query in search_queries]
+
         for collection_id in collection_ids:
             vector_store = self.get_chat_vector_store(collection_id)
             if not vector_store:
                 continue
-            
+
             try:
                 # Search with multiple query variations
                 seen_content_hashes = set()
-                
-                for query in search_queries:
-                    results = vector_store.similarity_search_with_relevance_scores(
-                        query, k=top_k
+                relevance_score_fn = vector_store._select_relevance_score_fn()
+
+                for query, query_vector in query_vectors:
+                    docs_and_scores = vector_store.similarity_search_with_score_by_vector(
+                        query_vector, k=top_k
                     )
-                    
+                    results = [(doc, relevance_score_fn(score)) for doc, score in docs_and_scores]
+
                     for doc, score in results:
                         # Deduplicate by content hash
                         content_hash = hash(doc.page_content[:100])
@@ -839,6 +850,7 @@ Answer:"""
 
     def _download_public_link_item(self, item: Dict[str, Any], destination_dir: str) -> Optional[Tuple[str, str]]:
         import requests
+        from ssrf_guard import assert_public_url_safe
 
         source_url = item.get("url", "").strip()
         if not source_url:
@@ -846,6 +858,12 @@ Answer:"""
 
         download_url = self._normalize_public_link_download_url(source_url)
         fallback_name = item.get("name") or f"public-link-{uuid.uuid4().hex[:8]}"
+
+        try:
+            assert_public_url_safe(download_url)
+        except Exception as exc:
+            logger.warning("Rejected public link item %s: %s", source_url, exc)
+            return None
 
         try:
             response = requests.get(
@@ -1940,35 +1958,36 @@ Answer:"""
         external_db_weight = db_weight
 
         results: Dict[str, Any] = {}
-        
-        # Step 3: Parallel search dengan weights
-        if include_pdf and pdf_weight > 0:
+
+        # Step 3: Parallel search dengan weights.
+        # Each source is independent I/O/CPU work, so the sub-searches run
+        # concurrently in a small thread pool instead of one after another.
+        # hybrid_search already executes off the event-loop thread (called via
+        # asyncio.to_thread), so this is a plain ThreadPoolExecutor, not asyncio.
+        def _search_pdf() -> tuple:
             logger.info(f"📄 Searching PDF (weight: {pdf_weight})...")
             pdf_docs = self.search_across_collections(
-                question, 
+                question,
                 collection_ids=collection_ids,
                 top_k=int(config.k_per_collection * pdf_weight)
             )
-            # Apply weight to scores
             for doc in pdf_docs:
                 if 'similarity_score' in doc.metadata:
                     doc.metadata['similarity_score'] *= pdf_weight
-            results['pdf_documents'] = pdf_docs
-        
-        if include_db and db_weight > 0:
+            return 'pdf_documents', pdf_docs
+
+        def _search_db() -> tuple:
             logger.info(f"🗄️ Searching DB (weight: {db_weight})...")
             target_tables = self.get_target_tables(question.lower())
             db_results = self.query_structured_data(search_terms, target_tables)
-            
-            # Apply weight to DB results
             for table_name, db_result in db_results.items():
                 if hasattr(db_result, 'data'):
                     for record in db_result.data:
                         if 'relevance_score' in record:
                             record['relevance_score'] *= db_weight
-            results['database_results'] = db_results
-        
-        if include_chat and chat_weight > 0:
+            return 'database_results', db_results
+
+        def _search_chat() -> tuple:
             logger.info(f"💬 Searching chat (weight: {chat_weight})...")
             file_filter = self.extract_file_reference(question)
             # Floor of 6: chat chunks are tiny (chat_chunk_size=300), so a
@@ -1980,13 +1999,12 @@ Answer:"""
                 file_filter=file_filter,
                 top_k=max(int(config.k_per_collection * chat_weight), 6)
             )
-            # Apply weight to scores
             for doc in chat_docs:
                 if 'similarity_score' in doc.metadata:
                     doc.metadata['similarity_score'] *= chat_weight
-            results['chat_documents'] = chat_docs
+            return 'chat_documents', chat_docs
 
-        if include_public_links and public_link_weight > 0 and public_link_sources:
+        def _search_public_links() -> tuple:
             logger.info(f"🌐 Searching active public links in realtime (weight: {public_link_weight})...")
             # Wider top_k than k_per_collection: public links span many files,
             # and the answer stage can consume up to 8 snippets.
@@ -1998,9 +2016,9 @@ Answer:"""
             for doc in public_link_docs:
                 if 'similarity_score' in doc.metadata:
                     doc.metadata['similarity_score'] *= public_link_weight
-            results['public_link_documents'] = public_link_docs
+            return 'public_link_documents', public_link_docs
 
-        if include_external_db and external_db_weight > 0 and external_db_connections:
+        def _search_external_db() -> tuple:
             logger.info(f"🗄️ Searching active external database connections in realtime (weight: {external_db_weight})...")
             external_db_docs = self.search_external_db_realtime(
                 question,
@@ -2010,7 +2028,26 @@ Answer:"""
             for doc in external_db_docs:
                 if 'similarity_score' in doc.metadata:
                     doc.metadata['similarity_score'] *= external_db_weight
-            results['external_db_documents'] = external_db_docs
+            return 'external_db_documents', external_db_docs
+
+        search_tasks = []
+        if include_pdf and pdf_weight > 0:
+            search_tasks.append(_search_pdf)
+        if include_db and db_weight > 0:
+            search_tasks.append(_search_db)
+        if include_chat and chat_weight > 0:
+            search_tasks.append(_search_chat)
+        if include_public_links and public_link_weight > 0 and public_link_sources:
+            search_tasks.append(_search_public_links)
+        if include_external_db and external_db_weight > 0 and external_db_connections:
+            search_tasks.append(_search_external_db)
+
+        if search_tasks:
+            with ThreadPoolExecutor(max_workers=len(search_tasks)) as executor:
+                futures = [executor.submit(task) for task in search_tasks]
+                for future in futures:
+                    key, value = future.result()
+                    results[key] = value
 
         # Step 4: Cross-source deduplication and ranking
         all_results = self.merge_and_rank_results(results, intent_analysis)

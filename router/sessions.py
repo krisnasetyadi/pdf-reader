@@ -9,13 +9,15 @@ Schema (two tables):
 Falls back to in-memory dict if DATABASE_URL is not set or DB is unreachable.
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone
 import logging
 import uuid
 import os
+
+from router.auth import get_current_user, UserRecord
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -103,10 +105,14 @@ def _ensure_tables(conn):
                     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
+                ALTER TABLE chat_sessions
+                    ADD COLUMN IF NOT EXISTS owner_id TEXT;
                 CREATE INDEX IF NOT EXISTS idx_chat_sessions_sid
                     ON chat_sessions (session_id);
                 CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated
                     ON chat_sessions (updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_chat_sessions_owner
+                    ON chat_sessions (owner_id);
 
                 CREATE TABLE IF NOT EXISTS chat_messages (
                     id          BIGSERIAL   PRIMARY KEY,
@@ -148,7 +154,10 @@ def _get_required_conn():
 # ---------------------------------------------------------------------------
 
 @router.post("/sessions", response_model=SessionResponse)
-async def upsert_session(body: UpsertSessionRequest):
+async def upsert_session(
+    body: UpsertSessionRequest,
+    user: UserRecord = Depends(get_current_user),
+):
     """
     Create or update a session.
     Session metadata goes into chat_sessions.
@@ -158,14 +167,29 @@ async def upsert_session(body: UpsertSessionRequest):
     conn = _get_required_conn()
     try:
         with conn.cursor() as cur:
+            if body.session_id:
+                cur.execute(
+                    "SELECT owner_id FROM chat_sessions WHERE session_id = %s",
+                    (sid,),
+                )
+                existing = cur.fetchone()
+                if (
+                    existing
+                    and existing.get("owner_id")
+                    and existing["owner_id"] != user.user_id
+                    and user.role != "admin"
+                ):
+                    raise HTTPException(status_code=403, detail="Not allowed to modify this session")
+
             cur.execute("""
                 INSERT INTO chat_sessions
-                    (session_id, title, pdf_collections, chat_collections, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, now(), now())
+                    (session_id, title, pdf_collections, chat_collections, owner_id, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now(), now())
                 ON CONFLICT (session_id) DO UPDATE
                     SET title            = EXCLUDED.title,
                         pdf_collections  = EXCLUDED.pdf_collections,
                         chat_collections = EXCLUDED.chat_collections,
+                        owner_id         = COALESCE(chat_sessions.owner_id, EXCLUDED.owner_id),
                         updated_at       = now()
                 RETURNING session_id, title, pdf_collections, chat_collections,
                           created_at, updated_at
@@ -174,6 +198,7 @@ async def upsert_session(body: UpsertSessionRequest):
                 body.title,
                 body.pdf_collections or [],
                 body.chat_collections or [],
+                user.user_id,
             ))
             session_row = cur.fetchone()
 
@@ -231,26 +256,45 @@ async def upsert_session(body: UpsertSessionRequest):
 
 
 @router.get("/sessions", response_model=List[SessionSummary])
-async def list_sessions():
-    """Return all sessions ordered by most recent, with message counts."""
+async def list_sessions(user: UserRecord = Depends(get_current_user)):
+    """Return sessions owned by the current user (all sessions for admins),
+    ordered by most recent, with message counts."""
     conn = _get_required_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT s.session_id,
-                       s.title,
-                       s.pdf_collections,
-                       s.chat_collections,
-                       s.created_at,
-                       s.updated_at,
-                       COUNT(m.id) AS message_count
-                FROM chat_sessions s
-                LEFT JOIN chat_messages m ON m.session_id = s.session_id
-                GROUP BY s.session_id, s.title, s.pdf_collections,
-                         s.chat_collections, s.created_at, s.updated_at
-                ORDER BY s.updated_at DESC
-                LIMIT 200
-            """)
+            if user.role == "admin":
+                cur.execute("""
+                    SELECT s.session_id,
+                           s.title,
+                           s.pdf_collections,
+                           s.chat_collections,
+                           s.created_at,
+                           s.updated_at,
+                           COUNT(m.id) AS message_count
+                    FROM chat_sessions s
+                    LEFT JOIN chat_messages m ON m.session_id = s.session_id
+                    GROUP BY s.session_id, s.title, s.pdf_collections,
+                             s.chat_collections, s.created_at, s.updated_at
+                    ORDER BY s.updated_at DESC
+                    LIMIT 200
+                """)
+            else:
+                cur.execute("""
+                    SELECT s.session_id,
+                           s.title,
+                           s.pdf_collections,
+                           s.chat_collections,
+                           s.created_at,
+                           s.updated_at,
+                           COUNT(m.id) AS message_count
+                    FROM chat_sessions s
+                    LEFT JOIN chat_messages m ON m.session_id = s.session_id
+                    WHERE s.owner_id = %s
+                    GROUP BY s.session_id, s.title, s.pdf_collections,
+                             s.chat_collections, s.created_at, s.updated_at
+                    ORDER BY s.updated_at DESC
+                    LIMIT 200
+                """, (user.user_id,))
             rows = cur.fetchall()
         return [
             SessionSummary(
@@ -275,19 +319,25 @@ async def list_sessions():
 
 
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str):
+async def get_session(session_id: str, user: UserRecord = Depends(get_current_user)):
     """Return full session including all messages from chat_messages table."""
     conn = _get_required_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT session_id, title, pdf_collections, chat_collections,
-                       created_at, updated_at
+                       owner_id, created_at, updated_at
                 FROM chat_sessions WHERE session_id = %s
             """, (session_id,))
             session_row = cur.fetchone()
             if not session_row:
                 raise HTTPException(status_code=404, detail="Session not found")
+            if (
+                user.role != "admin"
+                and session_row.get("owner_id")
+                and session_row["owner_id"] != user.user_id
+            ):
+                raise HTTPException(status_code=403, detail="Not allowed to access this session")
 
             cur.execute("""
                 SELECT message_id, role, content, model_used, created_at
@@ -327,11 +377,24 @@ async def get_session(session_id: str):
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, user: UserRecord = Depends(get_current_user)):
     """Delete a session. Messages are cascade-deleted automatically."""
     conn = _get_required_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute(
+                "SELECT owner_id FROM chat_sessions WHERE session_id = %s",
+                (session_id,),
+            )
+            existing = cur.fetchone()
+            if not existing:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if (
+                user.role != "admin"
+                and existing.get("owner_id")
+                and existing["owner_id"] != user.user_id
+            ):
+                raise HTTPException(status_code=403, detail="Not allowed to delete this session")
             cur.execute("DELETE FROM chat_sessions WHERE session_id = %s", (session_id,))
         return {"status": "deleted", "session_id": session_id}
     except Exception as e:

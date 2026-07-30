@@ -1,13 +1,14 @@
 # router/collections.py
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import FileResponse, RedirectResponse
 from models import CollectionInfo, SetPdfCollectionActiveRequest
 from config import config
 from processor import processor
 import storage as supabase_storage
+from router.auth import get_current_user, UserRecord
 import os
 import shutil
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 import logging
 import urllib.parse
@@ -16,14 +17,30 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _can_access(row: Optional[dict], user: UserRecord) -> bool:
+    """Admins can access everything; everyone else only their own collection."""
+    if user.role == "admin":
+        return True
+    if not row:
+        return False
+    return row.get("owner_id") == user.user_id
+
+
 @router.get("/collections", response_model=List[CollectionInfo])
-async def list_collections():
-    """List available PDF document collections (Supabase DB → S3 scan → local disk fallback)."""
+async def list_collections(user: UserRecord = Depends(get_current_user)):
+    """List PDF document collections visible to the current user.
+
+    Admins see every collection (Supabase DB → S3 scan → local disk fallback).
+    Non-admins only see DB-backed collections they own — the S3-scan and
+    local-disk fallbacks can't be attributed to an owner, so they're
+    admin-only.
+    """
     try:
         # ── Try Supabase DB first ──────────────────────────────────────────
         if supabase_storage.is_enabled():
             rows = supabase_storage.list_collections()
             if rows:  # non-empty DB result → use it
+                visible_rows = [row for row in rows if _can_access(row, user)]
                 result = [
                     CollectionInfo(
                         collection_id=row["collection_id"],
@@ -32,13 +49,19 @@ async def list_collections():
                         file_names=row.get("file_names") or [],
                         title=row.get("title") or None,
                         status=row.get("status") or "active",
+                        owner_id=row.get("owner_id"),
                     )
-                    for row in rows
+                    for row in visible_rows
                 ]
-                logger.info("Listed %d collections from Supabase DB", len(result))
+                logger.info("Listed %d/%d collections from Supabase DB for user %s",
+                            len(result), len(rows), user.user_id)
                 return result
 
-            # DB empty → scan S3 to find orphaned collections (with file names)
+            if user.role != "admin":
+                return []
+
+            # DB empty → scan S3 to find orphaned collections (admin-only,
+            # since these predate ownership tracking and can't be attributed).
             s3_cols = supabase_storage.list_collections_from_s3()
             if s3_cols:
                 logger.info("DB empty; found %d collections via S3 scan — auto-registering", len(s3_cols))
@@ -47,17 +70,21 @@ async def list_collections():
                     cid = col["collection_id"]
                     fnames = col["file_names"]
                     # Auto-register so next call hits DB
-                    supabase_storage.register_collection(cid, fnames, len(fnames))
+                    supabase_storage.register_collection(cid, fnames, len(fnames), owner_id=user.user_id)
                     result.append(CollectionInfo(
                         collection_id=cid,
                         document_count=len(fnames),
                         created_at=col.get("created_at", ""),
                         file_names=fnames,
                         title=col.get("title") or None,
+                        owner_id=user.user_id,
                     ))
                 return result
 
-        # ── Local disk fallback ────────────────────────────────────────────
+        if user.role != "admin":
+            return []
+
+        # ── Local disk fallback (admin-only — no owner metadata) ───────────
         collections = []
         if not os.path.exists(config.index_folder):
             return collections
@@ -94,10 +121,18 @@ async def list_collections():
 
 
 @router.post("/pdf-collection/activate")
-async def set_pdf_collection_active(body: SetPdfCollectionActiveRequest):
+async def set_pdf_collection_active(
+    body: SetPdfCollectionActiveRequest,
+    user: UserRecord = Depends(get_current_user),
+):
     """Toggle a PDF collection's active status (used as a knowledge source)."""
     if not supabase_storage.is_enabled() and not supabase_storage.has_database():
         raise HTTPException(status_code=503, detail="Database unavailable")
+    row = supabase_storage.get_collection(body.collection_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    if not _can_access(row, user):
+        raise HTTPException(status_code=403, detail="Not allowed to modify this collection")
     updated = supabase_storage.set_collection_status(body.collection_id, body.active)
     if not updated:
         raise HTTPException(status_code=404, detail="Collection not found")
@@ -105,9 +140,18 @@ async def set_pdf_collection_active(body: SetPdfCollectionActiveRequest):
 
 
 @router.delete("/collection/{collection_id}")
-async def delete_collection(collection_id: str):
+async def delete_collection(collection_id: str, user: UserRecord = Depends(get_current_user)):
     """Delete a collection from Supabase Storage + DB and local disk."""
     try:
+        if supabase_storage.is_enabled() or supabase_storage.has_database():
+            row = supabase_storage.get_collection(collection_id)
+            if row and not _can_access(row, user):
+                raise HTTPException(status_code=403, detail="Not allowed to delete this collection")
+            if not row and user.role != "admin":
+                # No ownership metadata (e.g. local-disk-only collection) —
+                # only admins may delete collections that can't be attributed.
+                raise HTTPException(status_code=403, detail="Not allowed to delete this collection")
+
         deleted = False
 
         # ── Supabase delete ────────────────────────────────────────────────
@@ -142,7 +186,11 @@ async def delete_collection(collection_id: str):
 
 
 @router.get("/files/{collection_id}/{file_name:path}")
-async def serve_pdf_file(collection_id: str, file_name: str):
+async def serve_pdf_file(
+    collection_id: str,
+    file_name: str,
+    user: UserRecord = Depends(get_current_user),
+):
     """
     Serve a PDF file.
     Priority: Supabase signed URL redirect → local disk FileResponse.
@@ -153,6 +201,10 @@ async def serve_pdf_file(collection_id: str, file_name: str):
         # Security: prevent path traversal
         if ".." in decoded_file_name or decoded_file_name.startswith("/"):
             raise HTTPException(status_code=400, detail="Invalid file name")
+
+        row = supabase_storage.get_collection(collection_id)
+        if not _can_access(row, user):
+            raise HTTPException(status_code=403, detail="Not allowed to access this collection")
 
         # ── Try Supabase signed URL first ──────────────────────────────────
         if supabase_storage.is_enabled():
@@ -206,12 +258,19 @@ async def serve_pdf_file(collection_id: str, file_name: str):
 
 
 @router.get("/collection/{collection_id}/files")
-async def list_collection_files(collection_id: str):
+async def list_collection_files(
+    collection_id: str,
+    user: UserRecord = Depends(get_current_user),
+):
     """List all PDF files in a collection (Supabase DB → local disk fallback)."""
     try:
+        db_row = supabase_storage.get_collection(collection_id)
+        if not _can_access(db_row, user):
+            raise HTTPException(status_code=403, detail="Not allowed to access this collection")
+
         # ── Try Supabase ───────────────────────────────────────────────────
         if supabase_storage.is_enabled():
-            row = supabase_storage.get_collection(collection_id)
+            row = db_row
             if row:
                 file_names = row.get("file_names") or []
                 files = [

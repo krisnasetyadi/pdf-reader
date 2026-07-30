@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
@@ -9,6 +9,7 @@ import os
 import uuid
 
 from config import config
+from router.auth import require_role, UserRecord
 
 from models import (
     CreateDatabaseConnectionRequest,
@@ -304,7 +305,7 @@ async def resolve_active_database_connections(
 
 
 @router.get("/database-connections", response_model=DatabaseConnectionsResponse)
-async def list_database_connections():
+async def list_database_connections(_: UserRecord = Depends(require_role("admin"))):
     conn = _get_app_conn()
     if not conn:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -323,7 +324,10 @@ async def list_database_connections():
 
 
 @router.post("/database-connections", response_model=DatabaseConnectionSource, status_code=status.HTTP_201_CREATED)
-async def create_database_connection(body: CreateDatabaseConnectionRequest):
+async def create_database_connection(
+    body: CreateDatabaseConnectionRequest,
+    _: UserRecord = Depends(require_role("admin")),
+):
     _validate_postgres_url(body.url)
 
     # Test the connection and browse its schema before persisting anything.
@@ -361,7 +365,10 @@ async def create_database_connection(body: CreateDatabaseConnectionRequest):
 
 
 @router.get("/database-connection/{connection_id}/tables", response_model=DatabaseConnectionSource)
-async def refresh_database_connection_tables(connection_id: str):
+async def refresh_database_connection_tables(
+    connection_id: str,
+    _: UserRecord = Depends(require_role("admin")),
+):
     app_conn = _get_app_conn()
     if not app_conn:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -402,7 +409,10 @@ async def refresh_database_connection_tables(connection_id: str):
 
 
 @router.post("/database-connection/activate")
-async def set_database_connection_active(body: SetDatabaseConnectionActiveRequest):
+async def set_database_connection_active(
+    body: SetDatabaseConnectionActiveRequest,
+    _: UserRecord = Depends(require_role("admin")),
+):
     conn = _get_app_conn()
     if not conn:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -443,7 +453,10 @@ async def set_database_connection_active(body: SetDatabaseConnectionActiveReques
 
 
 @router.delete("/database-connection/{connection_id}")
-async def delete_database_connection(connection_id: str):
+async def delete_database_connection(
+    connection_id: str,
+    _: UserRecord = Depends(require_role("admin")),
+):
     conn = _get_app_conn()
     if not conn:
         raise HTTPException(status_code=503, detail="Database unavailable")
