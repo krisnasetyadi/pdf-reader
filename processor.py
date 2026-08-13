@@ -171,7 +171,12 @@ class PDFQAProcessor:
             r'^/?help$',
             r'apa\s+yang\s+bisa\s+dilakukan\s+di\s*sini',
         ]
-        
+
+        # Known "/" commands (must mirror chat-ui's SLASH_COMMANDS). Backend
+        # guard only — the frontend intercepts unmatched slash input before
+        # it ever reaches this API, this exists for direct API calls/bypass.
+        self.known_slash_commands = {"/gap-check", "/collections", "/history", "/upload", "/help"}
+
         # Enhanced table routing
         self.enhanced_table_keywords = {
             "user_profiles": {
@@ -258,6 +263,25 @@ class PDFQAProcessor:
             "belum tersedia untuk dipakai serius._\n\n"
             "Ketik `/` di kolom chat kapan saja untuk lihat semua command."
         )
+
+    def is_unknown_slash_command(self, question: str) -> bool:
+        """True kalau pesan diawali '/' tapi bukan salah satu command yang
+        dikenal. Jaring pengaman untuk request yang bypass frontend's
+        command-menu (mis. panggilan API langsung) — jalur normal lewat UI
+        sudah ditangkap di chat-ui sebelum sampai ke sini."""
+        q = question.strip()
+        if not q.startswith('/'):
+            return False
+        first_token = q.split()[0].lower()
+        return first_token not in self.known_slash_commands
+
+    def build_unknown_command_answer(self, question: str) -> str:
+        """Deterministic reply for an unrecognized '/' command — same spirit
+        as build_meta_help_answer: never LLM-generated, so it can't
+        hallucinate a command that doesn't exist."""
+        attempted = question.strip().split()[0]
+        commands = "\n".join(f"- `{c}`" for c in sorted(self.known_slash_commands))
+        return f"Command `{attempted}` tidak dikenali.\n\n**Command yang tersedia:**\n\n{commands}\n\nKetik `/help` untuk detail."
 
     def expand_query(self, query):
         """Expand query with synonyms and related terms"""
@@ -2749,14 +2773,31 @@ Answer:"""
         selected_sources = {k for k, w in source_weights.items() if w and w > 0}
         db_is_sole_source = selected_sources in ({'db'}, {'external_db'})
         has_db_results = source_breakdown.get('database', 0) + source_breakdown.get('external_db', 0) > 0
+
+        # Sole-source-type detection: when the user filtered the request down
+        # to exactly one source type, the prompt wording should match that
+        # source's shape ("percakapan chat" vs "dokumen" vs "data tabel")
+        # instead of always saying "dokumen". None covers multi-source /
+        # unfiltered requests, which must keep the original combined wording
+        # unchanged — see _source_prompt_vocab.
+        sole_source_type = None
+        if selected_sources == {'pdf'}:
+            sole_source_type = 'pdf'
+        elif selected_sources == {'chat'}:
+            sole_source_type = 'chat'
+        elif selected_sources == {'public_link'}:
+            sole_source_type = 'public_link'
+        elif db_is_sole_source:
+            sole_source_type = 'database'
+
         if intent_analysis.get('is_aggregation') and db_is_sole_source and has_db_results:
             prompt = self._build_aggregation_prompt(context, question, conflicts)
         elif intent_analysis.get('is_comparison'):
             prompt = self._build_comparison_prompt(context, question, conflicts)
         elif intent_analysis.get('is_explanation'):
-            prompt = self._build_explanation_prompt(context, question, conflicts)
+            prompt = self._build_explanation_prompt(context, question, conflicts, sole_source_type=sole_source_type)
         else:
-            prompt = self._build_general_prompt(context, question, conflicts, source_breakdown)
+            prompt = self._build_general_prompt(context, question, conflicts, source_breakdown, sole_source_type=sole_source_type)
         
         try:
             result = llm.invoke(prompt)
@@ -2796,6 +2837,39 @@ Answer:"""
                 "conflicts_detected": False
             }
 
+    def _source_prompt_vocab(self, sole_source_type: Optional[str]) -> Dict[str, str]:
+        """Wording per jenis source, dipakai hanya kalau user memfilter request
+        ke tepat satu source type (sole_source_type). None (multi-source atau
+        tidak difilter) selalu jatuh ke wording 'pdf' — perilaku lama, tidak
+        berubah — supaya jalur gabungan tetap identik dengan sebelumnya."""
+        vocab = {
+            'pdf': {
+                'noun': 'dokumen',
+                'label': 'DOKUMEN',
+                'not_found': 'Informasi ini tidak ditemukan dalam dokumen yang diunggah.',
+                'extra_instruction': '',
+            },
+            'public_link': {
+                'noun': 'dokumen dari tautan publik',
+                'label': 'DOKUMEN DARI TAUTAN PUBLIK',
+                'not_found': 'Informasi ini tidak ditemukan dalam dokumen tautan publik yang tersedia.',
+                'extra_instruction': '',
+            },
+            'chat': {
+                'noun': 'percakapan chat',
+                'label': 'PERCAKAPAN CHAT',
+                'not_found': 'Informasi ini tidak ditemukan dalam percakapan chat yang tersedia.',
+                'extra_instruction': '- Percakapan chat bisa informal/singkatan/emoji — tetap ekstrak maknanya, jangan tuntut struktur formal.',
+            },
+            'database': {
+                'noun': 'data tabel',
+                'label': 'DATA TABEL',
+                'not_found': 'Informasi ini tidak ditemukan dalam data yang tersedia.',
+                'extra_instruction': '- Jika data berupa angka/tabel, tampilkan persis apa adanya tanpa dibulatkan sendiri.',
+            },
+        }
+        return vocab.get(sole_source_type, vocab['pdf'])
+
     def _build_aggregation_prompt(self, context: str, question: str, conflicts: List) -> str:
         """Build prompt untuk aggregation queries"""
         conflict_note = ""
@@ -2820,22 +2894,31 @@ Answer:"""
 
     JAWABAN:"""
 
-    def _build_general_prompt(self, context: str, question: str, conflicts: List, source_breakdown: Dict) -> str:
+    def _build_general_prompt(
+        self,
+        context: str,
+        question: str,
+        conflicts: List,
+        source_breakdown: Dict,
+        sole_source_type: Optional[str] = None,
+    ) -> str:
         """Build prompt untuk general queries"""
-        
-        return f"""Jawab pertanyaan berdasarkan dokumen berikut SAJA.
+        vocab = self._source_prompt_vocab(sole_source_type)
+        extra_instruction = f"\n{vocab['extra_instruction']}" if vocab['extra_instruction'] else ""
 
-DOKUMEN:
+        return f"""Jawab pertanyaan berdasarkan {vocab['noun']} berikut SAJA.
+
+{vocab['label']}:
 {context}
 
 Pertanyaan: {question}
 
 INSTRUKSI PENTING:
-- Jawab HANYA berdasarkan isi dokumen di atas
-- Jika dokumen memuat informasi yang berkaitan sebagian dengan pertanyaan, jawab sebaik mungkin dari bagian yang relevan itu dan sebutkan bahwa informasinya terbatas
-- Jika dokumen mengandung angka, tabel, atau data — ekstrak dan tampilkan langsung dalam jawaban
-- Katakan "Informasi ini tidak ditemukan dalam dokumen yang diunggah." HANYA jika tidak ada satu pun bagian dokumen yang berkaitan dengan pertanyaan
-- JANGAN gunakan pengetahuan umum atau informasi dari luar dokumen
+- Jawab HANYA berdasarkan isi {vocab['noun']} di atas
+- Jika {vocab['noun']} memuat informasi yang berkaitan sebagian dengan pertanyaan, jawab sebaik mungkin dari bagian yang relevan itu dan sebutkan bahwa informasinya terbatas
+- Jika {vocab['noun']} mengandung angka, tabel, atau data — ekstrak dan tampilkan langsung dalam jawaban
+- Katakan "{vocab['not_found']}" HANYA jika tidak ada satu pun bagian {vocab['noun']} yang berkaitan dengan pertanyaan
+- JANGAN gunakan pengetahuan umum atau informasi dari luar {vocab['noun']}{extra_instruction}
 {OFF_TOPIC_INSTRUCTION_ID}
 - Jawab ringkas dan jelas dalam Bahasa Indonesia
 
@@ -2860,21 +2943,30 @@ INSTRUKSI:
 
 JAWABAN:"""
 
-    def _build_explanation_prompt(self, context: str, question: str, conflicts: List) -> str:
+    def _build_explanation_prompt(
+        self,
+        context: str,
+        question: str,
+        conflicts: List,
+        sole_source_type: Optional[str] = None,
+    ) -> str:
         """Build prompt untuk explanation queries"""
-        return f"""Anda adalah asisten yang menjawab HANYA berdasarkan dokumen yang diberikan.
+        vocab = self._source_prompt_vocab(sole_source_type)
+        extra_instruction = f"\n{vocab['extra_instruction']}" if vocab['extra_instruction'] else ""
 
-DOKUMEN YANG TERSEDIA:
+        return f"""Anda adalah asisten yang menjawab HANYA berdasarkan {vocab['noun']} yang diberikan.
+
+{vocab['label']} YANG TERSEDIA:
 {context}
 
 PERTANYAAN: {question}
 
 INSTRUKSI PENTING:
-- Jawab HANYA berdasarkan informasi di dokumen yang sudah tersedia.
-- Jika dokumen memuat informasi yang berkaitan sebagian dengan pertanyaan, jawab sebaik mungkin dari bagian yang relevan itu dan sebutkan bahwa informasinya terbatas.
-- Katakan "Informasi ini tidak ditemukan dalam dokumen yang diunggah." HANYA jika tidak ada satu pun bagian dokumen yang berkaitan dengan pertanyaan.
-- JANGAN gunakan pengetahuan umum atau informasi dari luar dokumen
-- Gunakan bullet points atau daftar poin-poin HANYA jika dokumen asli menyebutkan daftar terpisah atau beberapa item yang terdaftar secara terpisah. Jika dokumen asli berisi narasi atau teks aslinya berupa penjelasan paragraf mengalir terus-menerus (seperti paragraf utuh tunggal), pertahankan sebagai paragraf mengalir/narasi utuh apa adanya tanpa dibuat menjadi poin-poin terpisah.
+- Jawab HANYA berdasarkan informasi di {vocab['noun']} yang sudah tersedia.
+- Jika {vocab['noun']} memuat informasi yang berkaitan sebagian dengan pertanyaan, jawab sebaik mungkin dari bagian yang relevan itu dan sebutkan bahwa informasinya terbatas.
+- Katakan "{vocab['not_found']}" HANYA jika tidak ada satu pun bagian {vocab['noun']} yang berkaitan dengan pertanyaan.
+- JANGAN gunakan pengetahuan umum atau informasi dari luar {vocab['noun']}
+- Gunakan bullet points atau daftar poin-poin HANYA jika sumber asli menyebutkan daftar terpisah atau beberapa item yang terdaftar secara terpisah. Jika sumber asli berisi narasi atau teks aslinya berupa penjelasan paragraf mengalir terus-menerus (seperti paragraf utuh tunggal), pertahankan sebagai paragraf mengalir/narasi utuh apa adanya tanpa dibuat menjadi poin-poin terpisah.{extra_instruction}
 {OFF_TOPIC_INSTRUCTION_ID}
 - Jawab dengan jelas dalam Bahasa Indonesia
 

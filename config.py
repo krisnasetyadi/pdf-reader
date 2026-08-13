@@ -31,6 +31,11 @@ class LLMProvider(str, Enum):
     GEMINI = "gemini"            # Cloud, free tier (60 req/min)
 
 
+# Floating alias to Google's current-recommended flash model — survives
+# Gemini version transitions (unlike a pinned name such as "gemini-2.5-flash",
+# which 404s on API keys/projects created after Google's cutoff for it).
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+
 # Available models per provider
 AVAILABLE_MODELS = {
     LLMProvider.HUGGINGFACE: [
@@ -39,7 +44,8 @@ AVAILABLE_MODELS = {
         "google/flan-t5-xl",        # Best quality, needs GPU
     ],
     LLMProvider.GEMINI: [
-        "gemini-2.5-flash",         # Latest, paid (recommended)
+        DEFAULT_GEMINI_MODEL,       # Floating alias to current flash gen (recommended, default)
+        "gemini-2.5-flash",         # Pinned — 404s on API keys/projects created after Google's cutoff
         "gemini-2.5-pro",           # Best quality, paid
         "gemini-2.0-flash",         # Previous gen flash
         "gemini-1.5-flash",         # Legacy, free tier
@@ -50,15 +56,15 @@ AVAILABLE_MODELS = {
 class Config(BaseSettings):
     # Default LLM Provider (used if no parameter sent)
     llm_provider: LLMProvider = Field(default=LLMProvider.GEMINI)
-    
+
     # HuggingFace settings (local - fallback)
     model_name: str = Field(default="google/flan-t5-base")
-    
+
     # (Ollama config removed for HuggingFace Spaces deployment)
-    
+
     # Gemini settings (cloud - free tier)
     gemini_api_key: Optional[str] = Field(default=None)
-    gemini_model: str = Field(default="gemini-2.5-flash")
+    gemini_model: str = Field(default=DEFAULT_GEMINI_MODEL)
 
     @property
     def default_llm_provider(self) -> LLMProvider:
@@ -66,7 +72,10 @@ class Config(BaseSettings):
 
     @property
     def default_llm_model(self) -> str:
-        return "gemini-2.5-flash"
+        # Delegates to gemini_model (env-configurable via GEMINI_MODEL) so
+        # changing .env is enough — this used to hardcode a literal model
+        # name here, silently ignoring gemini_model/the env var entirely.
+        return self.gemini_model
     
     # Common LLM settings
     embedding_model: str = Field(default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")

@@ -157,6 +157,27 @@ async def agnostic_query(
                 retrieved_count=0,
             )
 
+        # Unrecognized "/" command — safety net for requests that bypass the
+        # chat-ui command menu (which already intercepts unmatched slash
+        # input client-side). Short-circuits before hybrid_search/
+        # generate_hybrid_answer, same reasoning as meta-help above: a
+        # mistyped command has no document to ground an LLM answer in.
+        elif processor.is_unknown_slash_command(req.question):
+            elapsed = (datetime.now() - start_time).total_seconds()
+            return AgnosticQueryResponse(
+                answer=processor.build_unknown_command_answer(req.question),
+                model_used="system/unknown-command",
+                pdf_sources=[],
+                pdf_sources_detailed=[],
+                db_results={},
+                chat_results=[],
+                processing_time=elapsed,
+                search_terms=[req.question],
+                target_tables=[],
+                source_type="System",
+                retrieved_count=0,
+            )
+
         # Chat is admin-only (business rule — non-admins never search it,
         # regardless of what flags/ids the client sends).
         chat_collection_ids = req.chat_collection_ids if is_admin else []
