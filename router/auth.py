@@ -20,12 +20,14 @@ Schema (auto-created via ensure_schema in storage.py):
 from __future__ import annotations
 
 import os
+import time
 import uuid
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, field_validator
 
@@ -38,12 +40,61 @@ router = APIRouter()
 
 SECRET_KEY = os.getenv("JWT_SECRET")
 if not SECRET_KEY:
-    SECRET_KEY = "dev-local-jwt-secret-change-me"
-    logger.warning("JWT_SECRET not set; using temporary development secret")
+    raise RuntimeError(
+        "JWT_SECRET environment variable is not set. Refusing to start with a "
+        "guessable default secret — set JWT_SECRET before running the server."
+    )
 ALGORITHM   = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))  # 24 h
+PASSWORD_MAX_BYTES = 72  # bcrypt hard limit
 
 _bearer = HTTPBearer(auto_error=False)
+
+# ---------------------------------------------------------------------------
+# Login rate limiting — in-memory, per (email, IP). Resets on process restart;
+# fine for a single-instance deployment, not shared across multiple workers.
+# ---------------------------------------------------------------------------
+
+LOGIN_ATTEMPT_LIMIT = 5
+LOGIN_ATTEMPT_WINDOW_SECONDS = 15 * 60  # 15 minutes
+
+_failed_login_attempts: dict[str, list[float]] = defaultdict(list)
+
+# Cached hash used to equalize verify() timing when no user row is found,
+# so login doesn't leak "this email doesn't exist" via response latency.
+_dummy_hash_cache: dict[str, str] = {}
+
+
+def _rate_limit_key(email: str, request: Request) -> str:
+    client_ip = request.client.host if request.client else "unknown"
+    return f"{email.strip().lower()}:{client_ip}"
+
+
+def _check_rate_limit(key: str) -> None:
+    now = time.monotonic()
+    # .get() instead of indexing the defaultdict directly — a plain read
+    # must not auto-vivify a permanent entry for keys that never fail again
+    # (e.g. an attacker probing many distinct emails), or this dict grows
+    # for the life of the process with no cleanup path.
+    attempts = [t for t in _failed_login_attempts.get(key, []) if now - t < LOGIN_ATTEMPT_WINDOW_SECONDS]
+    if attempts:
+        _failed_login_attempts[key] = attempts
+    else:
+        _failed_login_attempts.pop(key, None)
+    if len(attempts) >= LOGIN_ATTEMPT_LIMIT:
+        retry_minutes = LOGIN_ATTEMPT_WINDOW_SECONDS // 60
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many failed login attempts. Try again in {retry_minutes} minutes.",
+        )
+
+
+def _record_failed_login(key: str) -> None:
+    _failed_login_attempts[key].append(time.monotonic())
+
+
+def _clear_failed_logins(key: str) -> None:
+    _failed_login_attempts.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -59,16 +110,30 @@ def _passlib():
     return CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def _hash_password(pwd_ctx, password: str) -> str:
-    """Hash password, truncating to 72 bytes (bcrypt hard limit)."""
-    return pwd_ctx.hash(password.encode()[:72].decode("utf-8", errors="ignore"))
+    """Hash password (length already validated to fit bcrypt's 72-byte limit)."""
+    return pwd_ctx.hash(password)
+
+def _dummy_password_hash(pwd_ctx) -> str:
+    """A real bcrypt hash of a fixed, unused password — used only so failed
+    logins for a non-existent email take the same time as a wrong-password
+    login for a real one."""
+    if "hash" not in _dummy_hash_cache:
+        _dummy_hash_cache["hash"] = pwd_ctx.hash("dummy-password-for-timing-equalization")
+    return _dummy_hash_cache["hash"]
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+def _validate_password_length(v: str) -> str:
+    if len(v.encode("utf-8")) > PASSWORD_MAX_BYTES:
+        raise ValueError(f"Password must be at most {PASSWORD_MAX_BYTES} bytes long")
+    return v
+
+
 class RegisterRequest(BaseModel):
-    email: str
+    email: EmailStr
     password: str
     role: str = "user"  # "user" | "admin"
 
@@ -79,8 +144,13 @@ class RegisterRequest(BaseModel):
             raise ValueError("role must be 'user' or 'admin'")
         return v
 
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        return _validate_password_length(v)
+
 class LoginRequest(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 class TokenResponse(BaseModel):
@@ -100,9 +170,19 @@ class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
 
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v: str) -> str:
+        return _validate_password_length(v)
+
 class AdminResetRequest(BaseModel):
-    email: str
+    email: EmailStr
     new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v: str) -> str:
+        return _validate_password_length(v)
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +314,8 @@ async def register(body: RegisterRequest):
     if not conn:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    _ensure_users_table(conn)
-
     try:
+        _ensure_users_table(conn)
         with conn.cursor() as cur:
             # Check email already exists
             cur.execute("SELECT user_id FROM users WHERE email = %s", (body.email,))
@@ -257,51 +336,62 @@ async def register(body: RegisterRequest):
                 RETURNING user_id, email, role
             """, (user_id, body.email, hashed, role))
             row = cur.fetchone()
-
-        conn.close()
-        token = _create_token(row["user_id"], row["email"], row["role"])
-        return TokenResponse(
-            access_token=token,
-            user_id=row["user_id"],
-            email=row["email"],
-            role=row["role"],
-        )
     except HTTPException:
         raise
     except Exception as e:
         logger.error("auth register error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Registration failed: {e}")
+    finally:
+        conn.close()
+
+    token = _create_token(row["user_id"], row["email"], row["role"])
+    return TokenResponse(
+        access_token=token,
+        user_id=row["user_id"],
+        email=row["email"],
+        role=row["role"],
+    )
 
 
 @router.post("/auth/login", response_model=TokenResponse)
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, request: Request):
     """Login and receive a JWT access token."""
+    rl_key = _rate_limit_key(body.email, request)
+    _check_rate_limit(rl_key)
+
     pwd_ctx = _passlib()
     conn = _get_conn()
 
     if not conn:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    _ensure_users_table(conn)
-
     try:
+        _ensure_users_table(conn)
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT user_id, email, password_hash, role, is_active FROM users WHERE email = %s",
                 (body.email,)
             )
             row = cur.fetchone()
-        conn.close()
     except Exception as e:
         logger.error("auth login db error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Login failed: {e}")
+    finally:
+        conn.close()
 
-    if not row or not pwd_ctx.verify(body.password, row["password_hash"]):
+    # Always run a bcrypt verify, even for an unknown email, so response time
+    # doesn't reveal whether the address is registered.
+    password_hash = row["password_hash"] if row else _dummy_password_hash(pwd_ctx)
+    password_ok = pwd_ctx.verify(body.password, password_hash)
+
+    if not row or not password_ok:
+        _record_failed_login(rl_key)
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not row["is_active"]:
         raise HTTPException(status_code=403, detail="Account is disabled")
 
+    _clear_failed_logins(rl_key)
     token = _create_token(row["user_id"], row["email"], row["role"])
     return TokenResponse(
         access_token=token,
@@ -341,13 +431,14 @@ async def change_password(
                 "UPDATE users SET password_hash = %s, updated_at = now() WHERE user_id = %s",
                 (new_hash, user.user_id)
             )
-        conn.close()
         return {"message": "Password updated successfully"}
     except HTTPException:
         raise
     except Exception as e:
         logger.error("change_password error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to change password: {e}")
+    finally:
+        conn.close()
 
 
 @router.post("/auth/admin/reset-password", status_code=200)
@@ -371,11 +462,12 @@ async def admin_reset_password(
                 "UPDATE users SET password_hash = %s, updated_at = now() WHERE email = %s",
                 (new_hash, body.email)
             )
-        conn.close()
         return {"message": f"Password reset for {body.email}"}
     except HTTPException:
         raise
     except Exception as e:
         logger.error("admin_reset_password error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to reset password: {e}")
+    finally:
+        conn.close()
 

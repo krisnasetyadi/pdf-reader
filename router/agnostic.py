@@ -128,6 +128,35 @@ async def agnostic_query(
             pdf_collection_ids = []
         logger.info("agnostic_query: %d PDF collection(s) accessible to user", len(pdf_collection_ids))
 
+        # "Meta/help" questions (about the app itself, e.g. "apa yang bisa
+        # dilakukan disini") short-circuit here — deliberately BEFORE running
+        # hybrid_search/generate_hybrid_answer, since there's no document to
+        # ground an LLM answer in. Answer is built from real state (this
+        # user's own collections), never LLM-generated. See
+        # Processor.is_meta_help_query / build_meta_help_answer.
+        if processor.is_meta_help_query(req.question):
+            all_rows = await asyncio.to_thread(supabase_storage.list_collections)
+            titles = [
+                row.get("title") or (row.get("file_names") or [""])[0] or row["collection_id"]
+                for row in all_rows
+                if row.get("collection_id") in allowed_pdf_ids
+            ]
+            help_answer = processor.build_meta_help_answer(len(allowed_pdf_ids), titles)
+            elapsed = (datetime.now() - start_time).total_seconds()
+            return AgnosticQueryResponse(
+                answer=help_answer,
+                model_used="system/meta-help",
+                pdf_sources=[],
+                pdf_sources_detailed=[],
+                db_results={},
+                chat_results=[],
+                processing_time=elapsed,
+                search_terms=[req.question],
+                target_tables=[],
+                source_type="System",
+                retrieved_count=0,
+            )
+
         # Chat is admin-only (business rule — non-admins never search it,
         # regardless of what flags/ids the client sends).
         chat_collection_ids = req.chat_collection_ids if is_admin else []

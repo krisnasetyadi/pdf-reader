@@ -9,13 +9,13 @@ import logging
 import os
 import uuid
 import shutil
-from datetime import datetime
 from typing import Optional, List
 
 import storage as supabase_storage
 from config import config
-from models import ChatUploadResponse, ChatPlatform, ChatCollection, SetChatCollectionActiveRequest
+from models import ChatUploadResponse, ChatPlatform, SetChatCollectionActiveRequest
 from chat_parser import ChatParser
+from chat_ingest import ingest_chat_messages
 from processor import processor
 from router.auth import require_role, UserRecord
 
@@ -72,75 +72,32 @@ async def upload_chat(
         # Parse chat file
         parser = ChatParser()
         messages, metadata = parser.parse_whatsapp(file_path)
-        
+
         if not messages:
             raise HTTPException(
                 status_code=400,
                 detail="No messages found in chat file. Please check the file format."
             )
-        
-        # Extract keywords automatically
-        keywords = parser.extract_keywords(messages, top_n=30)
-        metadata['keywords'] = keywords
-        logger.info(f"🔑 Extracted {len(keywords)} keywords for search boosting")
-        
-        # Chunk messages for vectorization
-        chunks = parser.chunk_messages_by_conversation(
-            messages,
-            chunk_size=config.chat_chunk_size,
-            overlap=config.chat_chunk_overlap
-        )
-        
-        # Create vector store from chunks
-        await _create_chat_vector_store(collection_id, chunks, metadata, platform)
-        
-        # Upload to Supabase Storage
-        if supabase_storage.is_enabled():
-            try:
-                index_dir = os.path.join(config.chat_index_folder, collection_id)
-                supabase_storage.upload_chat_file(collection_id, file_path, file.filename)
-                supabase_storage.upload_chat_index(collection_id, index_dir)
-                supabase_storage.register_chat_collection(
-                    collection_id=collection_id,
-                    file_name=file.filename,
-                    platform=platform.lower(),
-                    message_count=len(messages),
-                    participants=metadata.get("participants", []),
-                    date_range=metadata.get("date_range"),
-                    keywords=keywords,
-                    storage_paths=[f"chat-uploads/{collection_id}/{file.filename}"],
-                )
-                logger.info(f"☁️ Chat collection synced to Supabase: {collection_id}")
-            except Exception as e:
-                logger.warning(f"Supabase sync failed (disk fallback): {e}")
 
-        # Save collection metadata
-        collection = ChatCollection(
-            collection_id=collection_id,
-            platform=ChatPlatform(platform.lower()),
+        # Chunk, embed, index, and register — shared with the Telegram sync
+        # path (chat_ingest.py) so both stay searchable through identical code.
+        collection = await ingest_chat_messages(
+            collection_id,
+            messages,
             file_name=file.filename,
-            message_count=len(messages),
-            date_range=metadata.get("date_range"),
-            participants=metadata.get("participants", []),
-            created_at=datetime.now()
+            platform=ChatPlatform(platform.lower()),
+            raw_file_path=file_path,
         )
-        
-        # Add keywords to collection metadata
-        collection_dict = collection.model_dump(mode='json')
-        collection_dict['keywords'] = keywords
-        
-        # Save metadata to file
-        _save_collection_metadata(collection_id, collection_dict)
-        
+
         logger.info(f"✅ Chat collection created: {collection_id} with {len(messages)} messages")
-        
+
         return ChatUploadResponse(
             collection_id=collection_id,
             file_name=file.filename,
             platform=platform,
-            message_count=len(messages),
-            participants=metadata.get("participants", []),
-            date_range=metadata.get("date_range"),
+            message_count=collection.message_count,
+            participants=collection.participants,
+            date_range=collection.date_range,
             status="success"
         )
         
@@ -152,60 +109,6 @@ async def upload_chat(
             status_code=500,
             detail=f"Failed to process chat file: {str(e)}"
         )
-
-
-async def _create_chat_vector_store(
-    collection_id: str, 
-    chunks: List[dict], 
-    metadata: dict,
-    platform: str
-):
-    """Create FAISS vector store from chat chunks"""
-    from langchain_core.documents import Document
-    from langchain_community.vectorstores import FAISS
-    
-    logger.info(f"🔧 Creating vector store for {len(chunks)} chat chunks")
-    
-    # Convert chunks to Documents
-    documents = []
-    for i, chunk in enumerate(chunks):
-        doc = Document(
-            page_content=chunk["text"],
-            metadata={
-                "source": metadata.get("file_name", "unknown"),
-                "collection_id": collection_id,
-                "data_type": "chat",  # Distinguish from PDF
-                "platform": platform,
-                "chunk_index": i,
-                "message_count": chunk["message_count"],
-                "participants": ", ".join(chunk["participants"]),
-                "time_range_start": chunk["time_range"]["start"] if chunk["time_range"]["start"] else "",
-                "time_range_end": chunk["time_range"]["end"] if chunk["time_range"]["end"] else "",
-            }
-        )
-        documents.append(doc)
-    
-    # Create FAISS index using processor's embeddings
-    if not processor.embeddings:
-        processor.initialize_components()
-    
-    vector_store = FAISS.from_documents(documents, processor.embeddings)
-    
-    # Save to disk
-    index_path = os.path.join(config.chat_index_folder, collection_id)
-    vector_store.save_local(index_path)
-    
-    logger.info(f"💾 Chat vector store saved to: {index_path}")
-
-
-def _save_collection_metadata(collection_id: str, collection: dict):
-    """Save collection metadata to JSON file"""
-    import json
-    
-    metadata_path = os.path.join(config.chat_index_folder, collection_id, "metadata.json")
-    
-    with open(metadata_path, 'w', encoding='utf-8') as f:
-        json.dump(collection, f, indent=2, default=str)
 
 
 @router.get('/chat/collections')

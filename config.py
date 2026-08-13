@@ -178,7 +178,21 @@ class Config(BaseSettings):
     min_similarity_score: float = Field(default=0.3)
     
     # Supported chat platforms
-    supported_chat_platforms: List[str] = Field(default=["whatsapp"])
+    supported_chat_platforms: List[str] = Field(default=["whatsapp", "telegram"])
+
+    # Telegram (Telethon / MTProto) — live connection, not a file upload.
+    # Unlike Supabase/Gemini credentials, api_id/api_hash are NOT set here —
+    # each connection brings its own (entered per-connection in the "Connect
+    # Telegram" form, from https://my.telegram.org/apps), so different admins
+    # can each use their own app registration. Only the at-rest encryption key
+    # is server config, since it protects EVERY connection's secrets alike.
+    # Generate one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    telegram_session_encryption_key: Optional[str] = Field(default=None)
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return bool(self.telegram_session_encryption_key)
 
     class Config:
         env_file = ".env"

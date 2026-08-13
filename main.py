@@ -1,4 +1,7 @@
 # main.py
+from dotenv import load_dotenv
+load_dotenv()  # must run before config/router imports read os.environ
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -86,6 +89,8 @@ from router.auth import router as auth_router
 from router.agnostic import router as agnostic_router
 from router.public_links import router as public_links_router
 from router.database_connections import router as database_connections_router
+from router.compliance import router as compliance_router
+from router.telegram import router as telegram_router
 
 app.include_router(auth_router, prefix="/api/v1")           # Auth & RBAC
 app.include_router(upload_router, prefix="/api/v1")         # PDF upload
@@ -96,6 +101,8 @@ app.include_router(sessions_router, prefix="/api/v1")       # Chat session histo
 app.include_router(agnostic_router, prefix="/api/v1")       # Agnostic queries
 app.include_router(public_links_router, prefix="/api/v1")   # Public link sources
 app.include_router(database_connections_router, prefix="/api/v1")  # User-connected external databases
+app.include_router(compliance_router, prefix="/api/v1")     # Reference Framework Gap Analysis (Skill)
+app.include_router(telegram_router, prefix="/api/v1")       # Telegram live chat connections
 
 
 @app.get("/")

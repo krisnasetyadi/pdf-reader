@@ -46,6 +46,7 @@ pinecone-client==6.0.0
 pinecone-plugin-interface==0.0.7
 propcache==0.3.1
 psutil==7.0.0
+email-validator==2.2.0
 pydantic==2.11.4
 pydantic-settings==2.9.1
 pydantic_core==2.33.2
@@ -72,8 +73,11 @@ six==1.17.0
 sniffio==1.3.1
 boto3>=1.34.0
 psycopg2-binary>=2.9.9
+telethon>=1.36.0
+cryptography>=42.0.0
 pdfplumber>=0.11.0
 langchain-google-genai>=2.0.0
+reportlab>=4.0.0
 SQLAlchemy==2.0.41
 starlette==0.46.2
 sympy==1.14.0

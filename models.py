@@ -208,6 +208,11 @@ class HybridQueryRequest(BaseModel):
     llm_provider: Optional[str] = None  # "huggingface", "ollama", "gemini"
     llm_model: Optional[str] = None     # specific model name
 
+    # Skill selection (optional) - see GapAnalysisRequest for the dedicated
+    # gap-analysis flow. This lets normal chat scope itself to a skill
+    # context (e.g. the "meta/help" intent) without changing default behavior.
+    skill_id: Optional[str] = None
+
 class HybridResponse(BaseModel):
     answer: str
     pdf_sources: List[str]  # Keep for backward compatibility
@@ -294,6 +299,98 @@ class SetChatCollectionActiveRequest(BaseModel):
     active: bool
 
 
+# ===================== TELEGRAM MODELS =====================
+# Live connection (Telethon/MTProto login), not a file upload — see
+# router/telegram.py. A connection holds one encrypted user session; a
+# connection can have multiple "selected chats", each of which becomes its
+# own searchable ChatCollection (platform=telegram) once synced.
+
+class TelegramDialog(BaseModel):
+    dialog_id: str
+    title: str
+    type: str  # "user" | "group" | "channel"
+    participants_count: Optional[int] = None
+
+
+class TelegramDialogsResponse(BaseModel):
+    dialogs: List[TelegramDialog]
+    count: int
+
+
+class TelegramSelectedChat(BaseModel):
+    dialog_id: str
+    title: str
+    type: str
+    chat_collection_id: Optional[str] = None
+    message_count: Optional[int] = None
+    status: str = "active"
+    last_synced_at: Optional[Union[str, datetime]] = None
+
+
+class TelegramConnectionSource(BaseModel):
+    connection_id: str
+    label: str
+    phone_masked: str
+    status: str
+    created_at: Union[str, datetime]
+    selected_chats: List[TelegramSelectedChat] = []
+
+
+class TelegramConnectionsResponse(BaseModel):
+    connections: List[TelegramConnectionSource]
+    count: int
+
+
+class TelegramConnectStartRequest(BaseModel):
+    # api_id/api_hash identify the Telegram *application* making the request
+    # (from https://my.telegram.org/apps) — entered here per-connection rather
+    # than shared via server config, so different admins can each bring their
+    # own app registration.
+    api_id: int
+    api_hash: str
+    phone: str
+    label: Optional[str] = None
+
+
+class TelegramConnectStartResponse(BaseModel):
+    flow_id: str
+    phone: str
+
+
+class TelegramConnectVerifyRequest(BaseModel):
+    flow_id: str
+    code: str
+    password: Optional[str] = None  # only needed if the account has 2FA enabled
+
+
+class TelegramConnectVerifyResponse(BaseModel):
+    status: str  # "connected" | "password_required"
+    connection: Optional[TelegramConnectionSource] = None
+
+
+class TelegramSyncRequest(BaseModel):
+    dialog_ids: List[str]
+    message_limit: int = 2000
+
+
+class TelegramSyncResult(BaseModel):
+    dialog_id: str
+    title: str
+    chat_collection_id: str
+    message_count: int
+    status: str  # "success" | "error"
+    error: Optional[str] = None
+
+
+class TelegramSyncResponse(BaseModel):
+    results: List[TelegramSyncResult]
+
+
+class SetTelegramConnectionActiveRequest(BaseModel):
+    connection_id: str
+    active: bool
+
+
 class ChatUploadResponse(BaseModel):
     """Response after uploading chat file"""
     collection_id: str
@@ -325,3 +422,42 @@ class EnhancedHybridResponse(BaseModel):
     conflicts: Optional[List[Dict[str, Any]]] = None
     model_used: str
     confidence_score: float  # Overall confidence 0-1
+
+
+# ===================== SKILL / GAP-ANALYSIS MODELS =====================
+# Generic "Reference Framework Gap Analysis" capability. skill_id selects
+# behavior; ISO 27001 is just the first framework_name used with
+# "compliance_gap_check" — nothing here is ISO-specific.
+
+class GapAnalysisRequest(BaseModel):
+    skill_id: str  # "compliance_gap_check" | "scenario_regulatory_impact"
+    reference_collection_ids: List[str]  # array from day one (Opsi A: multi-framework per run)
+    framework_name: str  # free-label, e.g. "ISO 27001" or "Ketentuan PPh Pinjaman vs Modal"
+    target_collection_id: Optional[str] = None  # required for compliance_gap_check
+    scenario_input: Optional[str] = None  # used by scenario_regulatory_impact instead of a target collection
+
+
+class GapAnalysisItem(BaseModel):
+    label: str  # control/klausul name (Skill 1) or option name (Skill 2)
+    status: str  # "met" | "partial" | "not_met" | "unknown"
+    evidence: Optional[str] = None
+    source_citation: Optional[str] = None
+    recommendation: Optional[str] = None
+
+
+class GapAnalysisRun(BaseModel):
+    run_id: str
+    skill_id: str
+    framework_name: str
+    reference_collection_ids: List[str]
+    target_collection_id: Optional[str] = None
+    scenario_input: Optional[str] = None
+    status: str = "completed"
+    created_at: Union[str, datetime] = ""
+
+
+class GapAnalysisResponse(BaseModel):
+    run: GapAnalysisRun
+    items: List[GapAnalysisItem]
+    summary: Dict[str, int]  # counts per status, e.g. {"met": 60, "partial": 18, "not_met": 15, "unknown": 0}
+    disclaimer: Optional[str] = None

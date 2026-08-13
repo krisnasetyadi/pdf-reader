@@ -3,12 +3,11 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, status, Depends
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timezone
 import logging
 import os
 import uuid
 
-from config import config
+import app_db
 from router.auth import require_role, UserRecord
 
 from models import (
@@ -34,25 +33,6 @@ def _db_connections_user_id() -> str:
 def _enforce_scope() -> bool:
     raw = os.getenv("DB_CONNECTIONS_ENFORCE_SCOPE", "false")
     return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _app_database_url() -> str | None:
-    """URL of THIS app's own database (stores connection metadata only)."""
-    url = os.getenv("DATABASE_URL") or getattr(config, "database_url", None)
-    if not url:
-        return None
-    if "sslmode=" not in url:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}sslmode=require"
-    return url
-
-
-def _ts(value: Any) -> str:
-    if value is None:
-        return datetime.now(timezone.utc).isoformat()
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return str(value)
 
 
 def _validate_postgres_url(url: str) -> None:
@@ -83,19 +63,7 @@ def _redact_url(url: str) -> str:
 
 def _get_app_conn():
     """Connection to THIS app's own database (metadata store, not a data source)."""
-    database_url = _app_database_url()
-    if not database_url:
-        return None
-    try:
-        psycopg2 = __import__("psycopg2")
-        extras = __import__("psycopg2.extras", fromlist=["RealDictCursor"])
-        real_dict_cursor = getattr(extras, "RealDictCursor")
-        conn = psycopg2.connect(database_url, cursor_factory=real_dict_cursor, connect_timeout=10)
-        conn.autocommit = True
-        return conn
-    except Exception as exc:
-        logger.warning("database_connections: app DB connection failed: %s", exc)
-        return None
+    return app_db.get_app_conn("database_connections")
 
 
 def open_external_connection(url: str, timeout: int = 10):
@@ -265,7 +233,7 @@ def _as_source(row: Dict[str, Any], tables: Optional[List[Dict[str, Any]]] = Non
         url=_redact_url(row["url"]),
         status=row["status"],
         table_count=len(tables),
-        created_at=_ts(row.get("created_at")),
+        created_at=app_db.ts(row.get("created_at")),
         tables=[
             DbTableInfo(
                 name=t["name"],

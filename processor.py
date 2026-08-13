@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 import os
 import re
+import json
 import tempfile
 import uuid
 from typing import List, Dict, Any, Optional, Tuple
@@ -153,6 +154,23 @@ class PDFQAProcessor:
                 r'proses\s+[a-zA-Z]',
             ]
         }
+
+        # "Meta/help" — questions about the APP ITSELF (not document content),
+        # e.g. "apa yang bisa dilakukan disini". Checked separately from
+        # intent_patterns above because it must short-circuit the whole
+        # document-grounded pipeline (see is_meta_help_query/build_meta_help_answer):
+        # this is the one question type with no document to ground an LLM
+        # answer in, so it's kept deterministic instead of free-generated.
+        self.meta_help_patterns = [
+            r'apa\s+(saja\s+)?yang\s+bisa\s+(kamu|kau|anda|aplikasi\s+ini|doculens)',
+            r'apa\s+yang\s+bisa\s+(saya|kita)\s+lakukan\s+di\s*sini',
+            r'bisa\s+ngapain\s*(di\s*sini)?\s*\??$',
+            r'cara\s+(pakai|menggunakan|make)\s+(aplikasi|ini|doculens)',
+            r'fitur\s+apa\s+(saja\s+)?(yang\s+)?(ada|tersedia)',
+            r'command\s+apa\s+(saja\s+)?(yang\s+)?(ada|tersedia)',
+            r'^/?help$',
+            r'apa\s+yang\s+bisa\s+dilakukan\s+di\s*sini',
+        ]
         
         # Enhanced table routing
         self.enhanced_table_keywords = {
@@ -202,6 +220,44 @@ class PDFQAProcessor:
             "is_data_retrieval": 'data_retrieval' in detected_intents,
             "is_explanation": 'explanation' in detected_intents
         }
+
+    def is_meta_help_query(self, question: str) -> bool:
+        """True if the question is about the app itself (e.g. "apa yang bisa
+        dilakukan disini"), not about uploaded document content. Callers
+        should short-circuit the normal hybrid-search pipeline entirely and
+        use build_meta_help_answer() instead — see meta_help_patterns above
+        for why this must stay deterministic."""
+        q = question.lower().strip()
+        return any(re.search(p, q, re.IGNORECASE) for p in self.meta_help_patterns)
+
+    def build_meta_help_answer(self, pdf_collection_count: int, pdf_collection_titles: List[str]) -> str:
+        """Deterministic capability summary, generated from the skill
+        registry + the caller's real state (their own collections) — never
+        from LLM general knowledge, so it can't claim a feature that doesn't
+        exist."""
+        if pdf_collection_count > 0:
+            names = ", ".join(pdf_collection_titles[:5])
+            if pdf_collection_count > 5:
+                names += ", …"
+            collections_line = f"Kamu punya **{pdf_collection_count} collection dokumen** aktif: {names}."
+        else:
+            collections_line = (
+                "Kamu belum punya collection dokumen — upload dulu lewat panel "
+                "**Sources** di sidebar (atau ketik `/upload`)."
+            )
+
+        return (
+            "**Yang bisa dilakukan di DocuLens:**\n\n"
+            "- Tanya-jawab bebas atas dokumen PDF, database, dan chat log yang sudah kamu upload\n"
+            "- **Compliance Gap Check** (`/gap-check`) — bandingkan dokumen perusahaan ke standar/framework "
+            "apa pun (contoh: ISO 27001, ISO 9001), hasilnya status per item + rekomendasi, bisa didownload "
+            "jadi laporan PDF/markdown\n"
+            "- Lihat daftar collection kamu (`/collections`) atau riwayat gap-analysis (`/history`)\n\n"
+            f"{collections_line}\n\n"
+            "_Skill lain (analisis skenario/regulasi, mis. kasus pajak) masih tahap pengembangan — "
+            "belum tersedia untuk dipakai serius._\n\n"
+            "Ketik `/` di kolom chat kapan saja untuk lihat semua command."
+        )
 
     def expand_query(self, query):
         """Expand query with synonyms and related terms"""
@@ -2823,6 +2879,216 @@ INSTRUKSI PENTING:
 - Jawab dengan jelas dalam Bahasa Indonesia
 
 JAWABAN:"""
+
+    # ===================== SKILL: Reference Framework Gap Analysis =====================
+    # Generic "Skill" plumbing: skill_id picks a prompt builder + output schema.
+    # "compliance_gap_check" (Skill 1) is validated first via ISO 27001/9001 —
+    # nothing below is ISO-specific, ISO is just the first framework_name used.
+    # "scenario_regulatory_impact" (Skill 2) is scaffolded elsewhere and not
+    # wired into this orchestration yet — it is not validated for real use.
+
+    GAP_CHECK_BATCH_SIZE = 8
+    GAP_CHECK_MAX_WORKERS = 3  # cap concurrency to respect Gemini rate limits
+
+    def _get_reference_text(self, reference_collection_ids: List[str], max_chars: int = 12000) -> str:
+        """Concatenate the raw text of one or more reference collections."""
+        parts = []
+        for cid in reference_collection_ids:
+            vector_store = self.get_vector_store(cid)
+            if not vector_store:
+                continue
+            try:
+                docs = list(vector_store.docstore._dict.values())
+            except Exception as e:
+                logger.warning(f"_get_reference_text: could not read docstore for {cid}: {e}")
+                docs = []
+            for doc in docs:
+                parts.append(doc.page_content)
+        text = "\n\n".join(parts)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "..."
+        return text
+
+    def _parse_json_list(self, raw: str) -> List[str]:
+        """Best-effort JSON array parsing — strips markdown fences the model
+        might add despite instructions, falls back to substring extraction."""
+        text = re.sub(r'^```(json)?|```$', '', raw.strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except Exception:
+            pass
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+                if isinstance(data, list):
+                    return [str(x) for x in data]
+            except Exception:
+                pass
+        return []
+
+    def _parse_json_objects(self, raw: str) -> List[Dict[str, Any]]:
+        """Same as _parse_json_list but for an array of objects."""
+        text = re.sub(r'^```(json)?|```$', '', raw.strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+                if isinstance(data, list):
+                    return data
+            except Exception:
+                pass
+        return []
+
+    def extract_framework_items(self, reference_collection_ids: List[str], framework_name: str) -> List[str]:
+        """Ask the LLM to enumerate discrete requirement/control items from the
+        reference collection(s). Generic — works for any standard/framework
+        the user uploads, not just ISO."""
+        reference_text = self._get_reference_text(reference_collection_ids)
+        if not reference_text.strip():
+            return []
+
+        prompt = f"""Anda membaca dokumen standar/framework bernama "{framework_name}".
+
+DOKUMEN:
+{reference_text}
+
+TUGAS: Daftar SEMUA item/klausul/kontrol/requirement yang disebutkan sebagai satuan terpisah di dokumen ini.
+
+FORMAT WAJIB: kembalikan HANYA JSON array of string, tanpa markdown fence, tanpa penjelasan tambahan.
+Contoh: ["A.5.1 Kebijakan keamanan informasi", "A.5.2 Peran dan tanggung jawab keamanan informasi"]
+
+JSON:"""
+
+        llm, _ = self.get_llm(provider="gemini")
+        try:
+            result = llm.invoke(prompt)
+            raw = result.content.strip() if hasattr(result, 'content') else str(result).strip()
+            return self._parse_json_list(raw)
+        except Exception as e:
+            logger.error(f"extract_framework_items failed: {e}")
+            return []
+
+    def _build_gap_check_batch_prompt(self, framework_name: str, batch_items: List[Dict[str, str]]) -> str:
+        """batch_items: list of {"label": ..., "target_context": ...}. Generic
+        prompt — takes framework_name/context as parameters, no ISO-specific text."""
+        items_block = "\n\n".join(
+            f"ITEM {i+1}: {it['label']}\nBUKTI DARI DOKUMEN PERUSAHAAN:\n"
+            f"{it['target_context'] or '(tidak ditemukan bukti terkait)'}"
+            for i, it in enumerate(batch_items)
+        )
+        return f"""Anda adalah asisten audit compliance. Standar/framework yang dipakai: "{framework_name}".
+Sumber standar ini kemungkinan berupa ringkasan/interpretasi pihak ketiga, BUKAN teks resmi berlisensi —
+jangan berpura-pura mengutip klausul resmi kata demi kata.
+
+Untuk setiap ITEM di bawah, tentukan apakah BUKTI dari dokumen perusahaan menunjukkan item itu sudah terpenuhi.
+
+{items_block}
+
+Status yang valid:
+- "met": bukti jelas menunjukkan item terpenuhi
+- "partial": ada bukti tapi tidak lengkap
+- "not_met": tidak ada bukti relevan
+- "unknown": tidak bisa disimpulkan dari bukti yang ada
+
+FORMAT WAJIB: HANYA JSON array, tanpa markdown fence, satu object per item, urut sesuai urutan ITEM di atas:
+[{{"label": "...", "status": "met|partial|not_met|unknown", "evidence": "kutipan singkat dari BUKTI atau kosong", "recommendation": "rekomendasi singkat kalau belum met, atau kosong"}}]
+
+JSON:"""
+
+    def run_compliance_gap_check(
+        self,
+        reference_collection_ids: List[str],
+        target_collection_id: str,
+        framework_name: str,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """Skill 1 — Compliance Gap Check. Generic map-per-batch orchestration
+        (not an autonomous agent): extract items from reference once, then
+        batch+retrieve+verdict per group of items, run batches concurrently.
+        Returns (items, disclaimer)."""
+        items_labels = self.extract_framework_items(reference_collection_ids, framework_name)
+        disclaimer = (
+            f"Analisis ini berdasarkan dokumen \"{framework_name}\" yang diupload sebagai referensi "
+            "— kemungkinan ringkasan/interpretasi pihak ketiga, bukan teks standar resmi berlisensi. "
+            "Hasil ini bersifat bantuan awal, bukan audit/sertifikasi resmi."
+        )
+        if not items_labels:
+            return [], disclaimer
+
+        batches = [
+            items_labels[i:i + self.GAP_CHECK_BATCH_SIZE]
+            for i in range(0, len(items_labels), self.GAP_CHECK_BATCH_SIZE)
+        ]
+
+        def process_batch(batch_labels: List[str]) -> List[Dict[str, Any]]:
+            batch_items = []
+            for label in batch_labels:
+                try:
+                    results = self.search_across_collections(
+                        label, collection_ids=[target_collection_id], top_k=3
+                    )
+                except Exception as e:
+                    logger.warning(f"gap-check retrieval failed for item '{label}': {e}")
+                    results = []
+                target_context = "\n---\n".join(
+                    doc.page_content[:1500] for doc, _score in results[:3]
+                )
+                batch_items.append({"label": label, "target_context": target_context})
+
+            prompt = self._build_gap_check_batch_prompt(framework_name, batch_items)
+            llm, _ = self.get_llm(provider="gemini")
+            parsed: List[Dict[str, Any]] = []
+            try:
+                result = llm.invoke(prompt)
+                raw = result.content.strip() if hasattr(result, 'content') else str(result).strip()
+                parsed = self._parse_json_objects(raw)
+            except Exception as e:
+                logger.error(f"gap-check batch LLM call failed: {e}")
+
+            # Retry the batch once on parse failure / count mismatch — retry
+            # per-batch, not per-run, so one bad batch doesn't cost a full re-run.
+            if len(parsed) != len(batch_labels):
+                try:
+                    retry_prompt = prompt + "\n\nPERHATIAN: balas HANYA dengan JSON array yang valid, tanpa teks lain."
+                    result = llm.invoke(retry_prompt)
+                    raw = result.content.strip() if hasattr(result, 'content') else str(result).strip()
+                    parsed = self._parse_json_objects(raw)
+                except Exception as e:
+                    logger.error(f"gap-check batch retry failed: {e}")
+
+            out = []
+            for i, label in enumerate(batch_labels):
+                match = parsed[i] if i < len(parsed) else {}
+                status = str(match.get("status", "unknown")).lower()
+                if status not in ("met", "partial", "not_met", "unknown"):
+                    status = "unknown"
+                out.append({
+                    "label": match.get("label") or label,
+                    "status": status,
+                    "evidence": match.get("evidence") or None,
+                    "source_citation": f"target_collection:{target_collection_id}",
+                    "recommendation": match.get("recommendation") or None,
+                })
+            return out
+
+        all_items: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=self.GAP_CHECK_MAX_WORKERS) as executor:
+            futures = [executor.submit(process_batch, batch) for batch in batches]
+            for future in futures:
+                try:
+                    all_items.extend(future.result())
+                except Exception as e:
+                    logger.error(f"gap-check batch future failed: {e}")
+
+        return all_items, disclaimer
 
     def _validate_and_clean_answer(self, answer: str, question: str, results: List[Dict]) -> str:
         """Validate dan clean LLM answer"""

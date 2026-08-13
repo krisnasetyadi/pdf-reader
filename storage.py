@@ -152,6 +152,38 @@ def ensure_schema():
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_session
                     ON chat_messages (session_id, created_at ASC);
 
+                CREATE TABLE IF NOT EXISTS gap_analysis_runs (
+                    id                       BIGSERIAL   PRIMARY KEY,
+                    run_id                   TEXT        NOT NULL UNIQUE DEFAULT gen_random_uuid()::text,
+                    skill_id                 TEXT        NOT NULL,
+                    framework_name           TEXT        NOT NULL DEFAULT '',
+                    reference_collection_ids TEXT[]      NOT NULL DEFAULT '{}',
+                    target_collection_id     TEXT,
+                    scenario_input           TEXT,
+                    owner_id                 TEXT,
+                    status                   TEXT        NOT NULL DEFAULT 'completed'
+                                             CHECK (status IN ('running', 'completed', 'failed')),
+                    created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                CREATE INDEX IF NOT EXISTS idx_gap_analysis_runs_run_id
+                    ON gap_analysis_runs (run_id);
+                CREATE INDEX IF NOT EXISTS idx_gap_analysis_runs_owner
+                    ON gap_analysis_runs (owner_id, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS gap_analysis_items (
+                    id              BIGSERIAL   PRIMARY KEY,
+                    run_id          TEXT        NOT NULL REFERENCES gap_analysis_runs(run_id) ON DELETE CASCADE,
+                    label           TEXT        NOT NULL,
+                    status          TEXT        NOT NULL DEFAULT 'unknown'
+                                    CHECK (status IN ('met', 'partial', 'not_met', 'unknown')),
+                    evidence        TEXT,
+                    source_citation TEXT,
+                    recommendation  TEXT,
+                    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                CREATE INDEX IF NOT EXISTS idx_gap_analysis_items_run
+                    ON gap_analysis_items (run_id);
+
                 CREATE TABLE IF NOT EXISTS users (
                     id            BIGSERIAL    PRIMARY KEY,
                     user_id       TEXT         NOT NULL UNIQUE DEFAULT gen_random_uuid()::text,
@@ -167,7 +199,7 @@ def ensure_schema():
                 CREATE INDEX IF NOT EXISTS idx_users_user_id ON users (user_id);
             """)
         conn.close()
-        logger.info("Schema ensured: pdf_collections, chat_collections, chat_sessions, chat_messages.")
+        logger.info("Schema ensured: pdf_collections, chat_collections, chat_sessions, chat_messages, gap_analysis_runs, gap_analysis_items.")
     except Exception as e:
         logger.warning("Auto-migration skipped (disk fallback): %s", e)
     _migration_done = True
@@ -626,6 +658,143 @@ def set_collection_status(collection_id: str, active: bool) -> bool:
     except Exception as e:
         logger.warning("set_collection_status failed for %s: %s", collection_id, e)
         return False
+
+
+# ---------------------------------------------------------------------------
+# gap_analysis_runs / gap_analysis_items — generic "Skill" persistence
+# (compliance_gap_check today, scenario_regulatory_impact scaffolded).
+# Schema is skill-agnostic on purpose: no ISO/pajak-specific columns.
+# ---------------------------------------------------------------------------
+
+def create_gap_analysis_run(
+    run_id: str,
+    skill_id: str,
+    reference_collection_ids: List[str],
+    framework_name: str = "",
+    target_collection_id: Optional[str] = None,
+    scenario_input: Optional[str] = None,
+    owner_id: Optional[str] = None,
+    status: str = "completed",
+) -> bool:
+    ensure_schema()
+    conn = _db_conn()
+    if not conn:
+        logger.warning("create_gap_analysis_run: no DB connection, skipping insert")
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO gap_analysis_runs
+                    (run_id, skill_id, framework_name, reference_collection_ids,
+                     target_collection_id, scenario_input, owner_id, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    status = EXCLUDED.status
+            """, (run_id, skill_id, framework_name, reference_collection_ids,
+                  target_collection_id, scenario_input, owner_id, status))
+        conn.close()
+        logger.info("Created gap_analysis_run: %s (skill=%s)", run_id, skill_id)
+        return True
+    except Exception as e:
+        logger.warning("create_gap_analysis_run failed: %s", e)
+        return False
+
+
+def save_gap_analysis_items(run_id: str, items: List[Dict[str, Any]]) -> bool:
+    """items: dicts with keys label, status, evidence, source_citation, recommendation."""
+    ensure_schema()
+    if not items:
+        return True
+    conn = _db_conn()
+    if not conn:
+        logger.warning("save_gap_analysis_items: no DB connection, skipping insert")
+        return False
+    try:
+        with conn.cursor() as cur:
+            for item in items:
+                cur.execute("""
+                    INSERT INTO gap_analysis_items
+                        (run_id, label, status, evidence, source_citation, recommendation)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    run_id,
+                    item.get("label", ""),
+                    item.get("status", "unknown"),
+                    item.get("evidence"),
+                    item.get("source_citation"),
+                    item.get("recommendation"),
+                ))
+        conn.close()
+        return True
+    except Exception as e:
+        logger.warning("save_gap_analysis_items failed for run %s: %s", run_id, e)
+        return False
+
+
+def list_gap_analysis_runs(owner_id: Optional[str] = None, is_admin: bool = False) -> List[Dict[str, Any]]:
+    ensure_schema()
+    conn = _db_conn()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            if is_admin:
+                cur.execute("""
+                    SELECT run_id, skill_id, framework_name, reference_collection_ids,
+                           target_collection_id, scenario_input, owner_id, status, created_at
+                    FROM gap_analysis_runs ORDER BY created_at DESC
+                """)
+            else:
+                cur.execute("""
+                    SELECT run_id, skill_id, framework_name, reference_collection_ids,
+                           target_collection_id, scenario_input, owner_id, status, created_at
+                    FROM gap_analysis_runs WHERE owner_id = %s ORDER BY created_at DESC
+                """, (owner_id,))
+            rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("list_gap_analysis_runs failed: %s", e)
+        return []
+
+
+def get_gap_analysis_run(run_id: str) -> Optional[Dict[str, Any]]:
+    ensure_schema()
+    conn = _db_conn()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT run_id, skill_id, framework_name, reference_collection_ids,
+                       target_collection_id, scenario_input, owner_id, status, created_at
+                FROM gap_analysis_runs WHERE run_id = %s
+            """, (run_id,))
+            row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.warning("get_gap_analysis_run failed for %s: %s", run_id, e)
+        return None
+
+
+def get_gap_analysis_items(run_id: str) -> List[Dict[str, Any]]:
+    ensure_schema()
+    conn = _db_conn()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT label, status, evidence, source_citation, recommendation, created_at
+                FROM gap_analysis_items WHERE run_id = %s ORDER BY id ASC
+            """, (run_id,))
+            rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("get_gap_analysis_items failed for %s: %s", run_id, e)
+        return []
 
 
 # ---------------------------------------------------------------------------
