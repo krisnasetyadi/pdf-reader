@@ -178,6 +178,35 @@ async def agnostic_query(
                 retrieved_count=0,
             )
 
+        # No source selected at all — safety net for requests that bypass
+        # the chat-ui toggle guard (regenerate, direct API calls). Without
+        # this, hybrid_search silently returns empty results and
+        # generate_hybrid_answer still calls the LLM with an empty context,
+        # producing a misleading "not found in documents" answer instead of
+        # directing the user to pick a source.
+        elif not any([
+            req.include_pdf_results, req.include_db_results,
+            req.include_chat_results, req.include_public_links,
+            req.include_external_db,
+        ]):
+            elapsed = (datetime.now() - start_time).total_seconds()
+            return AgnosticQueryResponse(
+                answer=(
+                    "Pilih dulu minimal satu sumber (PDF, Database, Chat, atau Drive) "
+                    "sebelum bertanya, biar jawabannya bisa saya dasarkan dari data kamu."
+                ),
+                model_used="system/no-source-selected",
+                pdf_sources=[],
+                pdf_sources_detailed=[],
+                db_results={},
+                chat_results=[],
+                processing_time=elapsed,
+                search_terms=[req.question],
+                target_tables=[],
+                source_type="System",
+                retrieved_count=0,
+            )
+
         # Chat is admin-only (business rule — non-admins never search it,
         # regardless of what flags/ids the client sends).
         chat_collection_ids = req.chat_collection_ids if is_admin else []
