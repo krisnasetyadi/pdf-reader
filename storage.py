@@ -559,22 +559,26 @@ def delete_collection_from_db(collection_id: str) -> bool:
             logger.warning("delete PDF row failed: %s", e)
     s3 = _s3_client()
     if s3:
-        for bucket, fnames in [
-            (_INDICES_BUCKET, ["index.faiss", "index.pkl"]),
-            (_UPLOADS_BUCKET, []),
-        ]:
-            if not fnames:
+        # The DB row is already gone by now, so storage cleanup must never
+        # raise — a failure here would surface as a 500 and tell the user the
+        # delete failed when it actually succeeded. Indices use fixed key
+        # names; uploads are listed because their file names vary.
+        for bucket, keys in (
+            (_INDICES_BUCKET, [f"{collection_id}/index.faiss", f"{collection_id}/index.pkl"]),
+            (_UPLOADS_BUCKET, None),
+        ):
+            if keys is None:
                 try:
                     resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{collection_id}/")
-                    fnames = [o["Key"] for o in resp.get("Contents", [])]
-                except Exception:
-                    fnames = []
-            for key in (fnames if isinstance(fnames[0], str) and "/" in fnames[0]
-                        else [f"{collection_id}/{f}" for f in fnames] if fnames else []):
+                    keys = [o["Key"] for o in resp.get("Contents", [])]
+                except Exception as e:
+                    logger.warning("PDF S3 list failed (%s): %s", bucket, e)
+                    keys = []
+            for key in keys:
                 try:
                     s3.delete_object(Bucket=bucket, Key=key)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("PDF S3 delete failed (%s): %s", key, e)
     logger.info("Deleted PDF collection: %s", collection_id)
     return True
 
