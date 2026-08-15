@@ -315,7 +315,7 @@ async def _connect_with_saved_session(row: Dict[str, Any]):
 # Routes — connect flow
 # ---------------------------------------------------------------------------
 
-@router.post("/telegram/connect/start", response_model=TelegramConnectStartResponse)
+@router.post("/telegram-connections/connect/start", response_model=TelegramConnectStartResponse)
 async def telegram_connect_start(
     body: TelegramConnectStartRequest,
     _: UserRecord = Depends(require_role("admin")),
@@ -354,7 +354,7 @@ async def telegram_connect_start(
     return TelegramConnectStartResponse(flow_id=flow_id, phone=phone)
 
 
-@router.post("/telegram/connect/verify", response_model=TelegramConnectVerifyResponse)
+@router.post("/telegram-connections/connect/verify", response_model=TelegramConnectVerifyResponse)
 async def telegram_connect_verify(
     body: TelegramConnectVerifyRequest,
     user: UserRecord = Depends(require_role("admin")),
@@ -429,7 +429,7 @@ async def telegram_connect_verify(
 # Routes — manage connections
 # ---------------------------------------------------------------------------
 
-@router.get("/telegram/connections", response_model=TelegramConnectionsResponse)
+@router.get("/telegram-connections", response_model=TelegramConnectionsResponse)
 async def list_telegram_connections(_: UserRecord = Depends(require_role("admin"))):
     conn = _get_app_conn()
     if not conn:
@@ -450,7 +450,7 @@ async def list_telegram_connections(_: UserRecord = Depends(require_role("admin"
         conn.close()
 
 
-@router.get("/telegram-connection/{connection_id}/dialogs", response_model=TelegramDialogsResponse)
+@router.get("/telegram-connections/{connection_id}/dialogs", response_model=TelegramDialogsResponse)
 async def list_telegram_dialogs(
     connection_id: str,
     _: UserRecord = Depends(require_role("admin")),
@@ -478,7 +478,7 @@ async def list_telegram_dialogs(
     return TelegramDialogsResponse(dialogs=result, count=len(result))
 
 
-@router.post("/telegram-connection/{connection_id}/sync", response_model=TelegramSyncResponse)
+@router.post("/telegram-connections/{connection_id}/sync", response_model=TelegramSyncResponse)
 async def sync_telegram_connection(
     connection_id: str,
     body: TelegramSyncRequest,
@@ -569,7 +569,7 @@ async def sync_telegram_connection(
     return TelegramSyncResponse(results=results)
 
 
-@router.post("/telegram-connection/activate")
+@router.post("/telegram-connections/activate")
 async def set_telegram_connection_active(
     body: SetTelegramConnectionActiveRequest,
     _: UserRecord = Depends(require_role("admin")),
@@ -597,7 +597,7 @@ async def set_telegram_connection_active(
         conn.close()
 
 
-@router.delete("/telegram-connection/{connection_id}")
+@router.delete("/telegram-connections/{connection_id}")
 async def delete_telegram_connection(
     connection_id: str,
     _: UserRecord = Depends(require_role("admin")),

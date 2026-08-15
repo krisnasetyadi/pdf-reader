@@ -23,7 +23,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-@router.post('/chat/upload', response_model=ChatUploadResponse)
+@router.post('/chat-collections/upload', response_model=ChatUploadResponse)
 async def upload_chat(
     file: UploadFile = File(...),
     platform: str = Form(default="whatsapp"),
@@ -111,7 +111,7 @@ async def upload_chat(
         )
 
 
-@router.get('/chat/collections')
+@router.get('/chat-collections')
 async def list_chat_collections(_: UserRecord = Depends(require_role("admin"))):
     """List all available chat collections"""
     # Query Supabase DB first
@@ -144,7 +144,7 @@ async def list_chat_collections(_: UserRecord = Depends(require_role("admin"))):
     return {"collections": collections, "count": len(collections)}
 
 
-@router.get('/chat/collection/{collection_id}/preview')
+@router.get('/chat-collections/{collection_id}/preview')
 async def preview_chat_collection(
     collection_id: str,
     max_chars: int = Query(default=20000, ge=500, le=200000),
@@ -208,7 +208,7 @@ async def preview_chat_collection(
     }
 
 
-@router.post('/chat-collection/activate')
+@router.post('/chat-collections/activate')
 async def set_chat_collection_active(
     body: SetChatCollectionActiveRequest,
     _: UserRecord = Depends(require_role("admin")),
@@ -222,8 +222,7 @@ async def set_chat_collection_active(
     return {"status": "success", "collection_id": body.collection_id, "active": body.active}
 
 
-@router.delete('/chat/collections/{collection_id}')
-@router.delete('/chat/collection/{collection_id}')  # Alternative path for compatibility
+@router.delete('/chat-collections/{collection_id}')
 async def delete_chat_collection(
     collection_id: str,
     _: UserRecord = Depends(require_role("admin")),

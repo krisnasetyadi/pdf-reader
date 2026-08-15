@@ -302,7 +302,7 @@ def _cleanup_local_artifacts(collection_id: str, collection_path: str):
         logger.warning("Failed cleaning local artifacts for %s: %s", collection_id, exc)
 
 
-@router.post("/drive/folder-items", response_model=DriveFolderItemsResponse)
+@router.post("/pdf-collections/drive/folder-items", response_model=DriveFolderItemsResponse)
 async def list_drive_folder_items(
     payload: DriveFolderRequest,
     user: UserRecord = Depends(get_current_user),
@@ -363,7 +363,7 @@ async def list_drive_folder_items(
         )
 
 
-@router.post("/upload", response_model=UploadResponse)
+@router.post("/pdf-collections/upload", response_model=UploadResponse)
 async def upload_pdfs(
     files: List[UploadFile] = File(...),
     persist_mode: Literal["auto", "local", "database"] = Query(
@@ -424,7 +424,7 @@ async def upload_pdfs(
     )
 
 
-@router.post("/upload-from-url", response_model=UploadResponse)
+@router.post("/pdf-collections/upload-from-url", response_model=UploadResponse)
 async def upload_pdf_from_url(
     payload: UploadFromUrlRequest,
     persist_mode: Literal["auto", "local", "database"] = Query(
@@ -492,7 +492,7 @@ async def upload_pdf_from_url(
         raise HTTPException(status_code=500, detail="Failed to process remote PDF")
 
 
-@router.post("/upload-from-urls", response_model=UploadResponse)
+@router.post("/pdf-collections/upload-from-urls", response_model=UploadResponse)
 async def upload_pdfs_from_urls(
     payload: UploadFromUrlsRequest,
     persist_mode: Literal["auto", "local", "database"] = Query(

@@ -623,7 +623,7 @@ async def create_public_link(
         conn.close()
 
 
-@router.post("/public-link/activate")
+@router.post("/public-links/activate")
 async def set_public_link_active(
     body: SetPublicLinkActiveRequest,
     user: UserRecord = Depends(get_current_user),
@@ -671,7 +671,7 @@ async def set_public_link_active(
         conn.close()
 
 
-@router.delete("/public-link/{link_id}")
+@router.delete("/public-links/{link_id}")
 async def delete_public_link(link_id: str, user: UserRecord = Depends(get_current_user)):
     conn = _get_conn()
     if not conn:

@@ -26,7 +26,7 @@ def _can_access(row: Optional[dict], user: UserRecord) -> bool:
     return row.get("owner_id") == user.user_id
 
 
-@router.get("/collections", response_model=List[CollectionInfo])
+@router.get("/pdf-collections", response_model=List[CollectionInfo])
 async def list_collections(user: UserRecord = Depends(get_current_user)):
     """List PDF document collections visible to the current user.
 
@@ -120,7 +120,7 @@ async def list_collections(user: UserRecord = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/pdf-collection/activate")
+@router.post("/pdf-collections/activate")
 async def set_pdf_collection_active(
     body: SetPdfCollectionActiveRequest,
     user: UserRecord = Depends(get_current_user),
@@ -139,7 +139,7 @@ async def set_pdf_collection_active(
     return {"status": "success", "collection_id": body.collection_id, "active": body.active}
 
 
-@router.delete("/collection/{collection_id}")
+@router.delete("/pdf-collections/{collection_id}")
 async def delete_collection(collection_id: str, user: UserRecord = Depends(get_current_user)):
     """Delete a collection from Supabase Storage + DB and local disk."""
     try:

@@ -332,7 +332,7 @@ async def create_database_connection(
         app_conn.close()
 
 
-@router.get("/database-connection/{connection_id}/tables", response_model=DatabaseConnectionSource)
+@router.get("/database-connections/{connection_id}/tables", response_model=DatabaseConnectionSource)
 async def refresh_database_connection_tables(
     connection_id: str,
     _: UserRecord = Depends(require_role("admin")),
@@ -376,7 +376,7 @@ async def refresh_database_connection_tables(
     return _as_source(row, tables)
 
 
-@router.post("/database-connection/activate")
+@router.post("/database-connections/activate")
 async def set_database_connection_active(
     body: SetDatabaseConnectionActiveRequest,
     _: UserRecord = Depends(require_role("admin")),
@@ -420,7 +420,7 @@ async def set_database_connection_active(
         conn.close()
 
 
-@router.delete("/database-connection/{connection_id}")
+@router.delete("/database-connections/{connection_id}")
 async def delete_database_connection(
     connection_id: str,
     _: UserRecord = Depends(require_role("admin")),
