@@ -24,6 +24,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 from config import config
+from utils import DOCUMENT_EXTRACTORS
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,19 @@ def ensure_schema():
                                              CHECK (status IN ('running', 'completed', 'failed')),
                     created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
+                -- target_collection_id (singular) is kept only so old rows stay
+                -- readable; new rows are written to target_collection_ids below,
+                -- which supports comparing one guideline against several files.
+                ALTER TABLE gap_analysis_runs
+                    ADD COLUMN IF NOT EXISTS target_collection_ids TEXT[] NOT NULL DEFAULT '{}';
+                -- Backfill pre-existing rows once: every read path now selects only
+                -- the plural column, so without this, old runs would silently show
+                -- "no target" the moment this migration lands. Idempotent — the
+                -- WHERE clause only matches rows that haven't been backfilled yet.
+                UPDATE gap_analysis_runs
+                   SET target_collection_ids = ARRAY[target_collection_id]
+                 WHERE target_collection_id IS NOT NULL
+                   AND (target_collection_ids IS NULL OR target_collection_ids = '{}');
                 CREATE INDEX IF NOT EXISTS idx_gap_analysis_runs_run_id
                     ON gap_analysis_runs (run_id);
                 CREATE INDEX IF NOT EXISTS idx_gap_analysis_runs_owner
@@ -181,6 +195,8 @@ def ensure_schema():
                     recommendation  TEXT,
                     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
+                ALTER TABLE gap_analysis_items
+                    ADD COLUMN IF NOT EXISTS target_collection_id TEXT;
                 CREATE INDEX IF NOT EXISTS idx_gap_analysis_items_run
                     ON gap_analysis_items (run_id);
 
@@ -280,7 +296,7 @@ def list_collections_from_s3() -> List[Dict[str, Any]]:
             for obj in upload_resp.get("Contents", []):
                 key = obj["Key"]
                 fname = key.split("/", 1)[-1]
-                if fname and fname.lower().endswith(".pdf"):
+                if fname and os.path.splitext(fname)[1].lower() in DOCUMENT_EXTRACTORS:
                     file_names.append(fname)
                     if not created_at:
                         created_at = obj.get("LastModified", "")  # datetime or str
@@ -675,7 +691,7 @@ def create_gap_analysis_run(
     skill_id: str,
     reference_collection_ids: List[str],
     framework_name: str = "",
-    target_collection_id: Optional[str] = None,
+    target_collection_ids: Optional[List[str]] = None,
     scenario_input: Optional[str] = None,
     owner_id: Optional[str] = None,
     status: str = "completed",
@@ -690,12 +706,12 @@ def create_gap_analysis_run(
             cur.execute("""
                 INSERT INTO gap_analysis_runs
                     (run_id, skill_id, framework_name, reference_collection_ids,
-                     target_collection_id, scenario_input, owner_id, status)
+                     target_collection_ids, scenario_input, owner_id, status)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (run_id) DO UPDATE SET
                     status = EXCLUDED.status
             """, (run_id, skill_id, framework_name, reference_collection_ids,
-                  target_collection_id, scenario_input, owner_id, status))
+                  target_collection_ids or [], scenario_input, owner_id, status))
         conn.close()
         logger.info("Created gap_analysis_run: %s (skill=%s)", run_id, skill_id)
         return True
@@ -705,7 +721,8 @@ def create_gap_analysis_run(
 
 
 def save_gap_analysis_items(run_id: str, items: List[Dict[str, Any]]) -> bool:
-    """items: dicts with keys label, status, evidence, source_citation, recommendation."""
+    """items: dicts with keys label, status, evidence, source_citation,
+    recommendation, target_collection_id (which target this item was checked against)."""
     ensure_schema()
     if not items:
         return True
@@ -718,8 +735,8 @@ def save_gap_analysis_items(run_id: str, items: List[Dict[str, Any]]) -> bool:
             for item in items:
                 cur.execute("""
                     INSERT INTO gap_analysis_items
-                        (run_id, label, status, evidence, source_citation, recommendation)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                        (run_id, label, status, evidence, source_citation, recommendation, target_collection_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """, (
                     run_id,
                     item.get("label", ""),
@@ -727,6 +744,7 @@ def save_gap_analysis_items(run_id: str, items: List[Dict[str, Any]]) -> bool:
                     item.get("evidence"),
                     item.get("source_citation"),
                     item.get("recommendation"),
+                    item.get("target_collection_id"),
                 ))
         conn.close()
         return True
@@ -745,13 +763,13 @@ def list_gap_analysis_runs(owner_id: Optional[str] = None, is_admin: bool = Fals
             if is_admin:
                 cur.execute("""
                     SELECT run_id, skill_id, framework_name, reference_collection_ids,
-                           target_collection_id, scenario_input, owner_id, status, created_at
+                           target_collection_ids, scenario_input, owner_id, status, created_at
                     FROM gap_analysis_runs ORDER BY created_at DESC
                 """)
             else:
                 cur.execute("""
                     SELECT run_id, skill_id, framework_name, reference_collection_ids,
-                           target_collection_id, scenario_input, owner_id, status, created_at
+                           target_collection_ids, scenario_input, owner_id, status, created_at
                     FROM gap_analysis_runs WHERE owner_id = %s ORDER BY created_at DESC
                 """, (owner_id,))
             rows = cur.fetchall()
@@ -771,7 +789,7 @@ def get_gap_analysis_run(run_id: str) -> Optional[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT run_id, skill_id, framework_name, reference_collection_ids,
-                       target_collection_id, scenario_input, owner_id, status, created_at
+                       target_collection_ids, scenario_input, owner_id, status, created_at
                 FROM gap_analysis_runs WHERE run_id = %s
             """, (run_id,))
             row = cur.fetchone()
@@ -790,7 +808,7 @@ def get_gap_analysis_items(run_id: str) -> List[Dict[str, Any]]:
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT label, status, evidence, source_citation, recommendation, created_at
+                SELECT label, status, evidence, source_citation, recommendation, target_collection_id, created_at
                 FROM gap_analysis_items WHERE run_id = %s ORDER BY id ASC
             """, (run_id,))
             rows = cur.fetchall()
@@ -799,6 +817,24 @@ def get_gap_analysis_items(run_id: str) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning("get_gap_analysis_items failed for %s: %s", run_id, e)
         return []
+
+
+def delete_gap_analysis_run(run_id: str) -> bool:
+    """Deletes the run row; gap_analysis_items cascade-delete via the FK
+    (ON DELETE CASCADE), so no separate items cleanup is needed here."""
+    ensure_schema()
+    conn = _db_conn()
+    if not conn:
+        logger.warning("delete_gap_analysis_run: no DB connection, skipping delete")
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM gap_analysis_runs WHERE run_id = %s", (run_id,))
+        conn.close()
+        return True
+    except Exception as e:
+        logger.warning("delete_gap_analysis_run failed for %s: %s", run_id, e)
+        return False
 
 
 # ---------------------------------------------------------------------------
