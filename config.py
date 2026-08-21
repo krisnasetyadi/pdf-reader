@@ -90,6 +90,15 @@ class Config(BaseSettings):
     chat_upload_folder: str = Field(default="data/chat_uploads")
     chat_index_folder: str = Field(default="data/chat_indices")
 
+    # Legacy .doc extraction shells out to the `antiword` CLI (utils.py).
+    # Defaults to bare "antiword" (resolved via PATH) — correct in the Docker
+    # deployment, where apt-get installs it onto the system PATH. Override
+    # with a full path on a machine where antiword exists but isn't on PATH
+    # for the process running this app (e.g. bundled with Git for Windows at
+    # C:\Program Files\Git\mingw64\bin\antiword.exe, outside the default
+    # PowerShell PATH) instead of editing that machine's PATH itself.
+    antiword_path: str = Field(default="antiword")
+
     # Retrieval Parameters
     chunk_size: int = Field(default=500)
     chunk_overlap: int = Field(default=50)
