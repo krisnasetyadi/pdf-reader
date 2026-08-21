@@ -18,10 +18,13 @@ EXPOSE 7860
 WORKDIR /app
 
 # Install system dependencies
+# antiword: extracts text from legacy binary .doc uploads (utils.py
+# extract_text_from_doc) — python-docx only understands the newer .docx format.
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
     curl \
+    antiword \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (for better caching)
