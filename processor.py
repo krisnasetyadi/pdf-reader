@@ -2981,34 +2981,56 @@ JAWABAN:"""
 
     GAP_CHECK_BATCH_SIZE = 8
     GAP_CHECK_MAX_WORKERS = 3  # cap concurrency to respect Gemini rate limits
+    # Batches now multiply by len(target_collection_ids) (one guideline vs N
+    # files), so a flat cap of 3 would serialize multi-target runs more and
+    # more the more files are compared. Scale with target count, but stay
+    # under a hard ceiling so we don't blow past Gemini's rate limits either.
+    GAP_CHECK_MAX_WORKERS_CEILING = 6
+    # Chunking is 500 chars/chunk (config.py), so the old 12,000-char cap kept
+    # only ~24 chunks — often just a framework doc's title/scope/definitions,
+    # cut off before the actual itemized clause/control list. Gemini's context
+    # window comfortably fits far more, so extraction gets the real content.
+    GAP_CHECK_REFERENCE_MAX_CHARS = 60000
 
-    def _get_reference_text(self, reference_collection_ids: List[str], max_chars: int = 12000) -> str:
+    def _get_reference_text(self, reference_collection_ids: List[str], max_chars: Optional[int] = None) -> str:
         """Concatenate the raw text of one or more reference collections."""
+        if max_chars is None:
+            max_chars = self.GAP_CHECK_REFERENCE_MAX_CHARS
         parts = []
         for cid in reference_collection_ids:
             vector_store = self.get_vector_store(cid)
             if not vector_store:
+                logger.warning(f"_get_reference_text: no vector store found for reference collection {cid}")
                 continue
             try:
                 docs = list(vector_store.docstore._dict.values())
             except Exception as e:
                 logger.warning(f"_get_reference_text: could not read docstore for {cid}: {e}")
                 docs = []
+            if not docs:
+                logger.warning(f"_get_reference_text: reference collection {cid} has no indexed documents")
             for doc in docs:
                 parts.append(doc.page_content)
         text = "\n\n".join(parts)
         if len(text) > max_chars:
+            logger.info(f"_get_reference_text: truncating reference text from {len(text)} to {max_chars} chars")
             text = text[:max_chars] + "..."
         return text
 
     def _parse_json_list(self, raw: str) -> List[str]:
         """Best-effort JSON array parsing — strips markdown fences the model
-        might add despite instructions, falls back to substring extraction."""
+        might add despite instructions, falls back to substring extraction.
+        Also unwraps a single-key object (e.g. {"items": [...]})  the model
+        may return instead of a bare array despite being asked for one."""
         text = re.sub(r'^```(json)?|```$', '', raw.strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
         try:
             data = json.loads(text)
             if isinstance(data, list):
                 return [str(x) for x in data]
+            if isinstance(data, dict):
+                list_values = [v for v in data.values() if isinstance(v, list)]
+                if len(list_values) == 1:
+                    return [str(x) for x in list_values[0]]
         except Exception:
             pass
         match = re.search(r'\[.*\]', text, re.DOTALL)
@@ -3061,13 +3083,37 @@ Contoh: ["A.5.1 Kebijakan keamanan informasi", "A.5.2 Peran dan tanggung jawab k
 JSON:"""
 
         llm, _ = self.get_llm(provider="gemini")
+        raw = ""
         try:
             result = llm.invoke(prompt)
             raw = result.content.strip() if hasattr(result, 'content') else str(result).strip()
-            return self._parse_json_list(raw)
+            items = self._parse_json_list(raw)
         except Exception as e:
             logger.error(f"extract_framework_items failed: {e}")
-            return []
+            items = []
+
+        # Retry once on empty/malformed output — mirrors the retry already
+        # done per-batch below, so a single bad generation doesn't sink the
+        # whole run (this step has no batching to fall back on otherwise).
+        if not items:
+            logger.warning(
+                f"extract_framework_items: first attempt returned no items "
+                f"(raw response length={len(raw)}); retrying once"
+            )
+            try:
+                retry_prompt = prompt + "\n\nPERHATIAN: balas HANYA dengan JSON array of string yang valid, tanpa teks lain, tanpa markdown fence."
+                result = llm.invoke(retry_prompt)
+                raw = result.content.strip() if hasattr(result, 'content') else str(result).strip()
+                items = self._parse_json_list(raw)
+            except Exception as e:
+                logger.error(f"extract_framework_items retry failed: {e}")
+                items = []
+            if not items:
+                logger.error(
+                    f"extract_framework_items: retry also returned no items; "
+                    f"raw response (first 500 chars): {raw[:500]!r}"
+                )
+        return items
 
     def _build_gap_check_batch_prompt(self, framework_name: str, batch_items: List[Dict[str, str]]) -> str:
         """batch_items: list of {"label": ..., "target_context": ...}. Generic
@@ -3099,12 +3145,16 @@ JSON:"""
     def run_compliance_gap_check(
         self,
         reference_collection_ids: List[str],
-        target_collection_id: str,
+        target_collection_ids: List[str],
         framework_name: str,
     ) -> Tuple[List[Dict[str, Any]], str]:
         """Skill 1 — Compliance Gap Check. Generic map-per-batch orchestration
-        (not an autonomous agent): extract items from reference once, then
-        batch+retrieve+verdict per group of items, run batches concurrently.
+        (not an autonomous agent): extract reference items ONCE, then check
+        each target collection independently against that same item list —
+        so one guideline can be compared against several company files and
+        each item comes back tagged with which file/collection it was
+        checked against, instead of one merged verdict across all of them.
+        Batches (item groups x target collections) run concurrently.
         Returns (items, disclaimer)."""
         items_labels = self.extract_framework_items(reference_collection_ids, framework_name)
         disclaimer = (
@@ -3120,7 +3170,7 @@ JSON:"""
             for i in range(0, len(items_labels), self.GAP_CHECK_BATCH_SIZE)
         ]
 
-        def process_batch(batch_labels: List[str]) -> List[Dict[str, Any]]:
+        def process_batch(batch_labels: List[str], target_collection_id: str) -> List[Dict[str, Any]]:
             batch_items = []
             for label in batch_labels:
                 try:
@@ -3128,12 +3178,24 @@ JSON:"""
                         label, collection_ids=[target_collection_id], top_k=3
                     )
                 except Exception as e:
-                    logger.warning(f"gap-check retrieval failed for item '{label}': {e}")
+                    logger.warning(f"gap-check retrieval failed for item '{label}' in {target_collection_id}: {e}")
                     results = []
                 target_context = "\n---\n".join(
-                    doc.page_content[:1500] for doc, _score in results[:3]
+                    doc.page_content[:1500] for doc in results[:3]
                 )
-                batch_items.append({"label": label, "target_context": target_context})
+                # Per-chunk "source" filename is already set at ingestion time
+                # (utils.py) and preserved through retrieval — surface it here
+                # so evidence points at an actual file, not just the collection id.
+                source_files = []
+                for doc in results[:3]:
+                    src = doc.metadata.get("source")
+                    if src and src not in source_files:
+                        source_files.append(src)
+                batch_items.append({
+                    "label": label,
+                    "target_context": target_context,
+                    "source_files": source_files,
+                })
 
             prompt = self._build_gap_check_batch_prompt(framework_name, batch_items)
             llm, _ = self.get_llm(provider="gemini")
@@ -3162,18 +3224,29 @@ JSON:"""
                 status = str(match.get("status", "unknown")).lower()
                 if status not in ("met", "partial", "not_met", "unknown"):
                     status = "unknown"
+                source_files = batch_items[i]["source_files"]
+                citation = ", ".join(source_files) if source_files else f"target_collection:{target_collection_id}"
                 out.append({
                     "label": match.get("label") or label,
                     "status": status,
                     "evidence": match.get("evidence") or None,
-                    "source_citation": f"target_collection:{target_collection_id}",
+                    "source_citation": citation,
                     "recommendation": match.get("recommendation") or None,
+                    "target_collection_id": target_collection_id,
                 })
             return out
 
         all_items: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=self.GAP_CHECK_MAX_WORKERS) as executor:
-            futures = [executor.submit(process_batch, batch) for batch in batches]
+        effective_workers = max(1, min(
+            self.GAP_CHECK_MAX_WORKERS_CEILING,
+            self.GAP_CHECK_MAX_WORKERS * len(target_collection_ids),
+        ))
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = [
+                executor.submit(process_batch, batch, target_collection_id)
+                for target_collection_id in target_collection_ids
+                for batch in batches
+            ]
             for future in futures:
                 try:
                     all_items.extend(future.result())
