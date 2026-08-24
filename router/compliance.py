@@ -74,9 +74,7 @@ async def run_gap_analysis(
     allowed_pdf_ids = set(await asyncio.to_thread(
         supabase_storage.list_collection_ids_for_user, user.user_id, is_admin
     ))
-    requested_ids = set(body.reference_collection_ids)
-    if body.target_collection_id:
-        requested_ids.add(body.target_collection_id)
+    requested_ids = set(body.reference_collection_ids) | set(body.target_collection_ids)
     if not requested_ids.issubset(allowed_pdf_ids):
         raise HTTPException(status_code=403, detail="One or more collections are not accessible to you")
 
@@ -84,10 +82,10 @@ async def run_gap_analysis(
     items: List[dict] = []
 
     if body.skill_id == "compliance_gap_check":
-        if not body.target_collection_id:
+        if not body.target_collection_ids:
             raise HTTPException(
                 status_code=400,
-                detail="target_collection_id is required for compliance_gap_check",
+                detail="target_collection_ids is required for compliance_gap_check",
             )
         # run_compliance_gap_check makes several sequential blocking LLM
         # calls — off the event loop, or one gap-analysis run freezes every
@@ -95,7 +93,7 @@ async def run_gap_analysis(
         items, disclaimer = await asyncio.to_thread(
             processor.run_compliance_gap_check,
             reference_collection_ids=body.reference_collection_ids,
-            target_collection_id=body.target_collection_id,
+            target_collection_ids=body.target_collection_ids,
             framework_name=body.framework_name,
         )
     else:
@@ -110,7 +108,7 @@ async def run_gap_analysis(
         skill_id=body.skill_id,
         reference_collection_ids=body.reference_collection_ids,
         framework_name=body.framework_name,
-        target_collection_id=body.target_collection_id,
+        target_collection_ids=body.target_collection_ids,
         scenario_input=body.scenario_input,
         owner_id=user.user_id,
         status="completed",
@@ -122,7 +120,7 @@ async def run_gap_analysis(
         "skill_id": body.skill_id,
         "framework_name": body.framework_name,
         "reference_collection_ids": body.reference_collection_ids,
-        "target_collection_id": body.target_collection_id,
+        "target_collection_ids": body.target_collection_ids,
         "scenario_input": body.scenario_input,
         "status": "completed",
         "created_at": "",
@@ -163,6 +161,22 @@ async def get_gap_analysis_run(run_id: str, user: UserRecord = Depends(get_curre
         summary=_summarize(items),
         disclaimer=None,
     )
+
+
+@router.delete("/analysis/gap-analysis/{run_id}")
+async def delete_gap_analysis_run(run_id: str, user: UserRecord = Depends(get_current_user)):
+    """Delete a stored run — runs never overwrite each other (each gets a
+    fresh run_id), so this is the only way to remove one from history."""
+    run_row = supabase_storage.get_gap_analysis_run(run_id)
+    if not run_row:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not _can_access_run(run_row, user):
+        raise HTTPException(status_code=403, detail="Not allowed to delete this run")
+
+    ok = await asyncio.to_thread(supabase_storage.delete_gap_analysis_run, run_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to delete run")
+    return {"run_id": run_id, "deleted": True}
 
 
 @router.get("/analysis/gap-analysis/{run_id}/export")
@@ -206,35 +220,64 @@ def _render_markdown(run_row: dict, items: List[dict]) -> str:
         f"- Skill: {run_row.get('skill_id', '')}",
         f"- Dibuat: {run_row.get('created_at', '')}",
         f"- Reference collection: {', '.join(run_row.get('reference_collection_ids') or [])}",
-        f"- Target collection: {run_row.get('target_collection_id') or '-'}",
+        f"- Target collection(s): {', '.join(run_row.get('target_collection_ids') or []) or '-'}",
         "",
         "> Catatan: laporan ini dihasilkan AI berdasarkan dokumen yang diupload user — "
         "bukan audit/sertifikasi resmi maupun nasihat pajak/hukum resmi.",
         "",
-        "| Item | Status | Evidence | Rekomendasi |",
-        "|---|---|---|---|",
+        "| Item | File | Status | Evidence | Rekomendasi |",
+        "|---|---|---|---|---|",
     ]
     for item in items:
+        source = (item.get("source_citation") or item.get("target_collection_id") or "").replace("|", "/")
         evidence = (item.get("evidence") or "").replace("\n", " ").replace("|", "/")
         recommendation = (item.get("recommendation") or "").replace("\n", " ").replace("|", "/")
-        lines.append(f"| {item.get('label', '')} | {item.get('status', '')} | {evidence} | {recommendation} |")
+        lines.append(f"| {item.get('label', '')} | {source} | {item.get('status', '')} | {evidence} | {recommendation} |")
     return "\n".join(lines)
 
 
 def _render_pdf(run_row: dict, items: List[dict], markdown_fallback: str) -> bytes:
     """Render the run as a PDF. Falls back to returning the markdown as raw
     bytes if reportlab isn't installed — library choice is an implementation
-    detail, not a blocker for shipping this endpoint (per plan)."""
+    detail, not a blocker for shipping this endpoint (per plan).
+
+    Landscape + Paragraph cells (not raw strings) so Evidence/Rekomendasi —
+    which can be several sentences of free-text from the LLM — wrap inside
+    their column instead of forcing the table wider than the page or
+    overlapping neighboring columns, which is what a plain reportlab Table
+    does with unwrapped strings and no column widths."""
     try:
         import io
-        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.units import mm
         from reportlab.lib import colors
-        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from xml.sax.saxutils import escape
 
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=A4)
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=landscape(A4),
+            leftMargin=15 * mm,
+            rightMargin=15 * mm,
+            topMargin=15 * mm,
+            bottomMargin=15 * mm,
+        )
         styles = getSampleStyleSheet()
+        cell_style = ParagraphStyle("GapCell", parent=styles["Normal"], fontSize=8, leading=10)
+        header_style = ParagraphStyle(
+            "GapHeader", parent=cell_style, textColor=colors.white, fontName="Helvetica-Bold",
+        )
+
+        def cell(text: str, style: ParagraphStyle = cell_style) -> Paragraph:
+            # Paragraph markup treats bare "&"/"<"/">" as XML — escape first,
+            # then restore line breaks as <br/> so multi-line evidence/
+            # recommendation text doesn't collapse onto one line.
+            safe = escape(text or "—").replace("\n", "<br/>")
+            return Paragraph(safe, style)
+
+        has_multiple_targets = len(run_row.get("target_collection_ids") or []) > 1
 
         story = [
             Paragraph(f"Laporan Gap Analysis — {run_row.get('framework_name', '')}", styles["Title"]),
@@ -248,21 +291,34 @@ def _render_pdf(run_row: dict, items: List[dict], markdown_fallback: str) -> byt
             Spacer(1, 12),
         ]
 
-        table_data = [["Item", "Status", "Evidence", "Rekomendasi"]]
+        headers = ["Item", "File", "Status", "Evidence", "Rekomendasi"]
+        col_widths = [100, 100, 60, 245, 245]  # sums to ~750pt, fits landscape A4 minus margins
+        if not has_multiple_targets:
+            headers.pop(1)
+            col_widths.pop(1)
+            col_widths[-2] += 50  # File's freed width goes to the two free-text columns,
+            col_widths[-1] += 50  # not Item/Status which don't need it
+
+        table_data = [[cell(h, header_style) for h in headers]]
         for item in items:
-            table_data.append([
-                item.get("label", ""),
-                item.get("status", ""),
-                (item.get("evidence") or "")[:200],
-                (item.get("recommendation") or "")[:200],
-            ])
-        table = Table(table_data, repeatRows=1)
+            row = [cell(item.get("label", ""))]
+            if has_multiple_targets:
+                source = item.get("source_citation") or item.get("target_collection_id") or ""
+                row.append(cell(source))
+            row.append(cell(item.get("status", "")))
+            row.append(cell(item.get("evidence", "")))
+            row.append(cell(item.get("recommendation", "")))
+            table_data.append(row)
+
+        table = Table(table_data, colWidths=col_widths, repeatRows=1)
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2E6B4C")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ]))
         story.append(table)
         doc.build(story)

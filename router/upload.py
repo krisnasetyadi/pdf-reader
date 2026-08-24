@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
-from utils import process_pdfs
+from utils import process_pdfs, DOCUMENT_EXTRACTORS
 from ssrf_guard import assert_public_url_safe
 from models import (
     DriveFolderItem,
@@ -180,6 +180,29 @@ def _safe_pdf_filename(candidate: Optional[str], fallback_stem: str) -> str:
         file_name = f"{file_name}.pdf"
 
     return file_name
+
+
+def _safe_upload_filename(candidate: Optional[str], fallback_stem: str) -> str:
+    """Like _safe_pdf_filename but preserves whatever real extension the
+    upload had (.docx/.csv/.xlsx/.txt) instead of force-appending .pdf —
+    force-appending would both mislabel the file and feed it to the wrong
+    text extractor downstream (which dispatches purely by extension).
+
+    Extension is pulled from the ORIGINAL name before the stem is sanitized —
+    a fully non-ASCII stem (e.g. "会社概要.docx") sanitizes to underscores,
+    and stripping " ._" from "____.docx" eats the separator dot along with
+    them, leaving a bare "docx" with no dot for Path(...).suffix to find.
+    Keeping ext out of that stripping keeps it intact regardless."""
+    raw_name = (candidate or "").strip()
+    file_name = Path(raw_name).name if raw_name else ""
+    ext = Path(file_name).suffix.lower()
+    stem = file_name[: len(file_name) - len(ext)] if ext else file_name
+    stem = re.sub(r"[^A-Za-z0-9._ -]", "_", stem).strip(" ._")
+
+    if not stem:
+        stem = fallback_stem
+
+    return f"{stem}{ext or '.pdf'}"
 
 
 def _normalize_title(candidate: Optional[str]) -> Optional[str]:
@@ -372,7 +395,8 @@ async def upload_pdfs(
     ),
     user: UserRecord = Depends(get_current_user),
 ):
-    """Upload and process PDF files, then persist to Supabase Storage."""
+    """Upload and process document files (PDF, DOC, DOCX, CSV, XLSX, TXT), then
+    persist to Supabase Storage."""
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
@@ -384,9 +408,10 @@ async def upload_pdfs(
     file_names: List[str] = []
     for file in files:
         file_name = file.filename or ""
-        if not file_name.lower().endswith('.pdf'):
+        ext = Path(file_name).suffix.lower()
+        if ext not in DOCUMENT_EXTRACTORS:
             continue
-        safe_name = _safe_pdf_filename(file_name, f"upload-{len(saved_files) + 1}")
+        safe_name = _safe_upload_filename(file_name, f"upload-{len(saved_files) + 1}")
         file_path = os.path.join(collection_path, safe_name)
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
@@ -395,7 +420,7 @@ async def upload_pdfs(
 
     if not saved_files:
         raise HTTPException(
-            status_code=400, detail="No valid PDF files uploaded")
+            status_code=400, detail="No valid files uploaded (supported: PDF, DOC, DOCX, CSV, XLSX, TXT)")
 
     try:
         chunk_count = await asyncio.to_thread(process_pdfs, saved_files, collection_id)
@@ -403,6 +428,13 @@ async def upload_pdfs(
         shutil.rmtree(collection_path, ignore_errors=True)
         logger.error(f"Upload failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to process PDFs")
+
+    if chunk_count <= 0:
+        shutil.rmtree(collection_path, ignore_errors=True)
+        raise HTTPException(
+            status_code=400,
+            detail="No readable text was found in the uploaded file(s) — the collection was not created.",
+        )
 
     _register_uploaded_collection(
         collection_id,

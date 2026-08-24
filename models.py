@@ -433,7 +433,7 @@ class GapAnalysisRequest(BaseModel):
     skill_id: str  # "compliance_gap_check" | "scenario_regulatory_impact"
     reference_collection_ids: List[str]  # array from day one (Opsi A: multi-framework per run)
     framework_name: str  # free-label, e.g. "ISO 27001" or "Ketentuan PPh Pinjaman vs Modal"
-    target_collection_id: Optional[str] = None  # required for compliance_gap_check
+    target_collection_ids: List[str] = []  # required for compliance_gap_check — one guideline vs N files, verdict per file
     scenario_input: Optional[str] = None  # used by scenario_regulatory_impact instead of a target collection
 
 
@@ -443,6 +443,7 @@ class GapAnalysisItem(BaseModel):
     evidence: Optional[str] = None
     source_citation: Optional[str] = None
     recommendation: Optional[str] = None
+    target_collection_id: Optional[str] = None  # which target collection/file this item was checked against
 
 
 class GapAnalysisRun(BaseModel):
@@ -450,7 +451,7 @@ class GapAnalysisRun(BaseModel):
     skill_id: str
     framework_name: str
     reference_collection_ids: List[str]
-    target_collection_id: Optional[str] = None
+    target_collection_ids: List[str] = []
     scenario_input: Optional[str] = None
     status: str = "completed"
     created_at: Union[str, datetime] = ""

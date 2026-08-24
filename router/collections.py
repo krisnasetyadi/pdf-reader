@@ -4,6 +4,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from models import CollectionInfo, SetPdfCollectionActiveRequest
 from config import config
 from processor import processor
+from utils import DOCUMENT_EXTRACTORS
 import storage as supabase_storage
 from router.auth import get_current_user, UserRecord
 import os
@@ -37,7 +38,12 @@ async def list_collections(user: UserRecord = Depends(get_current_user)):
     """
     try:
         # ── Try Supabase DB first ──────────────────────────────────────────
-        if supabase_storage.is_enabled():
+        # has_database() (DATABASE_URL), not is_enabled() (S3 creds) — this
+        # branch only ever does Postgres reads; gating it on S3 config meant
+        # a deployment with DATABASE_URL set but no S3 creds would silently
+        # skip the DB and fall through to the local-disk/S3-scan branches
+        # below, hiding real rows non-admins own (they get `[]` outright).
+        if supabase_storage.has_database():
             rows = supabase_storage.list_collections()
             if rows:  # non-empty DB result → use it
                 visible_rows = [row for row in rows if _can_access(row, user)]
@@ -102,7 +108,7 @@ async def list_collections(user: UserRecord = Depends(get_current_user)):
                     if os.path.exists(upload_path):
                         file_names = [
                             f for f in os.listdir(upload_path)
-                            if f.lower().endswith(".pdf")
+                            if os.path.splitext(f)[1].lower() in DOCUMENT_EXTRACTORS
                         ]
                     collections.append(CollectionInfo(
                         collection_id=entry,
@@ -155,7 +161,11 @@ async def delete_collection(collection_id: str, user: UserRecord = Depends(get_c
         deleted = False
 
         # ── Supabase delete ────────────────────────────────────────────────
-        if supabase_storage.is_enabled():
+        # has_database(), not is_enabled() — delete_collection_from_db is a
+        # Postgres DELETE that handles the S3-cleanup step internally on its
+        # own (skipping it gracefully when S3 isn't configured), so gating
+        # this call on S3 creds meant the DB row could survive a "delete".
+        if supabase_storage.has_database():
             ok = supabase_storage.delete_collection_from_db(collection_id)
             if ok:
                 deleted = True
@@ -239,15 +249,27 @@ async def serve_pdf_file(
                 ),
             )
 
-        if not file_path.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in DOCUMENT_EXTRACTORS:
+            raise HTTPException(status_code=400, detail="Unsupported file type")
 
-        logger.info("Serving PDF from local disk: %s", file_path)
+        # Only PDF/TXT/CSV can render inline in a browser; DOC/DOCX/XLSX always
+        # download instead of showing a blank/broken inline viewer.
+        media_type, disposition = {
+            ".pdf": ("application/pdf", "inline"),
+            ".txt": ("text/plain", "inline"),
+            ".csv": ("text/csv", "inline"),
+            ".doc": ("application/msword", "attachment"),
+            ".docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "attachment"),
+            ".xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "attachment"),
+        }.get(ext, ("application/octet-stream", "attachment"))
+
+        logger.info("Serving file from local disk: %s", file_path)
         return FileResponse(
             path=file_path,
-            media_type="application/pdf",
+            media_type=media_type,
             filename=decoded_file_name,
-            headers={"Content-Disposition": f'inline; filename="{decoded_file_name}"'},
+            headers={"Content-Disposition": f'{disposition}; filename="{decoded_file_name}"'},
         )
 
     except HTTPException:
@@ -269,7 +291,9 @@ async def list_collection_files(
             raise HTTPException(status_code=403, detail="Not allowed to access this collection")
 
         # ── Try Supabase ───────────────────────────────────────────────────
-        if supabase_storage.is_enabled():
+        # has_database(), not is_enabled() — `row` below is db_row, already
+        # fetched from Postgres above; nothing here touches S3.
+        if supabase_storage.has_database():
             row = db_row
             if row:
                 file_names = row.get("file_names") or []
@@ -294,7 +318,7 @@ async def list_collection_files(
 
         files = []
         for fname in os.listdir(upload_dir):
-            if fname.lower().endswith(".pdf"):
+            if os.path.splitext(fname)[1].lower() in DOCUMENT_EXTRACTORS:
                 fp = os.path.join(upload_dir, fname)
                 stat = os.stat(fp)
                 files.append({

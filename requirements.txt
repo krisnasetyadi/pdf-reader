@@ -76,6 +76,8 @@ psycopg2-binary>=2.9.9
 telethon>=1.36.0
 cryptography>=42.0.0
 pdfplumber>=0.11.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
 langchain-google-genai>=2.0.0
 reportlab>=4.0.0
 SQLAlchemy==2.0.41
