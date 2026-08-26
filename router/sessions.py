@@ -36,7 +36,9 @@ class StoredMessage(BaseModel):
 
 class UpsertSessionRequest(BaseModel):
     session_id: Optional[str] = None   # if None -> create new
-    title: str
+    # Optional past creation — omitted, the existing title (auto-derived or
+    # since renamed via PUT /sessions/{id}) is left untouched (MS-253).
+    title: Optional[str] = None
     messages: List[StoredMessage]
     pdf_collections: Optional[List[str]] = []
     chat_collections: Optional[List[str]] = []
@@ -187,9 +189,9 @@ async def upsert_session(
             cur.execute("""
                 INSERT INTO chat_sessions
                     (session_id, title, pdf_collections, chat_collections, owner_id, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, now(), now())
+                VALUES (%s, COALESCE(%s, 'Untitled conversation'), %s, %s, %s, now(), now())
                 ON CONFLICT (session_id) DO UPDATE
-                    SET title            = EXCLUDED.title,
+                    SET title            = COALESCE(%s, chat_sessions.title),
                         pdf_collections  = EXCLUDED.pdf_collections,
                         chat_collections = EXCLUDED.chat_collections,
                         owner_id         = COALESCE(chat_sessions.owner_id, EXCLUDED.owner_id),
@@ -202,6 +204,7 @@ async def upsert_session(
                 body.pdf_collections or [],
                 body.chat_collections or [],
                 user.user_id,
+                body.title,
             ))
             session_row = cur.fetchone()
 
