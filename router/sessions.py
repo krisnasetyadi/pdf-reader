@@ -59,6 +59,9 @@ class SessionSummary(BaseModel):
     pdf_collections: List[str]
     chat_collections: List[str]
 
+class RenameSessionRequest(BaseModel):
+    title: str
+
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -369,6 +372,70 @@ async def get_session(session_id: str, user: UserRecord = Depends(get_current_us
     except Exception as e:
         logger.error("sessions get DB error: %s", e)
         raise HTTPException(status_code=500, detail="Failed to load session")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@router.put("/sessions/{session_id}", response_model=SessionSummary)
+async def rename_session(
+    session_id: str,
+    body: RenameSessionRequest,
+    user: UserRecord = Depends(get_current_user),
+):
+    """Rename a session. Title only — messages are untouched, so this never
+    needs the client to resend the whole conversation just to relabel it."""
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    conn = _get_required_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT owner_id FROM chat_sessions WHERE session_id = %s",
+                (session_id,),
+            )
+            existing = cur.fetchone()
+            if not existing:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if (
+                user.role != "admin"
+                and existing.get("owner_id")
+                and existing["owner_id"] != user.user_id
+            ):
+                raise HTTPException(status_code=403, detail="Not allowed to rename this session")
+
+            cur.execute("""
+                UPDATE chat_sessions
+                SET title = %s, updated_at = now()
+                WHERE session_id = %s
+                RETURNING session_id, title, pdf_collections, chat_collections,
+                          created_at, updated_at
+            """, (title, session_id))
+            session_row = cur.fetchone()
+
+            cur.execute(
+                "SELECT COUNT(*) AS message_count FROM chat_messages WHERE session_id = %s",
+                (session_id,),
+            )
+            message_count = cur.fetchone()["message_count"]
+
+        return SessionSummary(
+            session_id=session_row["session_id"],
+            title=session_row["title"],
+            message_count=int(message_count or 0),
+            created_at=_ts(session_row["created_at"]),
+            updated_at=_ts(session_row["updated_at"]),
+            pdf_collections=list(session_row["pdf_collections"] or []),
+            chat_collections=list(session_row["chat_collections"] or []),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("sessions rename DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to rename session")
     finally:
         try:
             conn.close()
