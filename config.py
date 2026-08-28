@@ -212,6 +212,13 @@ class Config(BaseSettings):
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_session_encryption_key)
 
+    # Stripe (dummy/test-mode payment flow — MS-90). Test-mode keys only;
+    # see router/payment.py.
+    stripe_secret_key: Optional[str] = Field(default=None)
+    stripe_webhook_secret: Optional[str] = Field(default=None)
+    # Used to build the Checkout success/cancel redirect URLs.
+    frontend_url: str = Field(default="http://localhost:3008")
+
     class Config:
         env_file = ".env"
         extra = 'ignore'
