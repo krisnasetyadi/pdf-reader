@@ -147,6 +147,28 @@ class DatabaseConnectionsResponse(BaseModel):
     count: int
 
 
+class CreateCheckoutSessionRequest(BaseModel):
+    plan_id: str
+
+
+class CheckoutSessionResponse(BaseModel):
+    checkout_url: str
+    payment_id: str
+
+
+class PaymentRecord(BaseModel):
+    payment_id: str
+    plan_id: str
+    amount: int
+    currency: str
+    status: str
+    created_at: Union[str, datetime]
+
+
+class PaymentResponse(BaseModel):
+    payment: PaymentRecord
+
+
 class QAResponse(BaseModel):
     answer: str
     sources: List[str]  # Now includes collection IDs

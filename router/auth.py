@@ -5,7 +5,11 @@ Authentication & RBAC
 Endpoints:
   POST /auth/register   — create account (role defaults to "user")
   POST /auth/login      — returns JWT access token
-  GET  /auth/me         — returns current user (requires valid token)
+  GET  /auth/me         — returns current user's full profile, refreshed from the DB
+  POST /auth/me         — update own display name and/or avatar
+  GET  /auth/admin/users           — admin-only: list team members this admin created
+  POST /auth/admin/users           — admin-only: add a team member (role "user"), capped by max_sub_users
+  POST /auth/admin/users/activate  — admin-only: activate/deactivate a team member this admin created
 
 RBAC dependency helpers (importable by other routers):
   get_current_user(token)        → UserRecord (any authenticated user)
@@ -14,7 +18,11 @@ RBAC dependency helpers (importable by other routers):
   AdminOnly                      → FastAPI Depends shortcut (admin only)
 
 Schema (auto-created via ensure_schema in storage.py):
-  users (user_id, email, password_hash, role, is_active, created_at, updated_at)
+  users (user_id, email, password_hash, role, is_active, name, avatar_url, created_by, max_sub_users, created_at, updated_at)
+  name           — display name, editable via POST /auth/me
+  avatar_url     — small avatar image as a data: URL, editable via POST /auth/me
+  created_by     — user_id of the admin who added this account (NULL for self-registered users)
+  max_sub_users  — how many team members this user may add as an admin; set manually per admin for now
 """
 
 from __future__ import annotations
@@ -132,10 +140,25 @@ def _validate_password_length(v: str) -> str:
     return v
 
 
+NAME_MAX_LENGTH = 100
+
+
+def _validate_name(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return v
+    v = v.strip()
+    if not v:
+        raise ValueError("Name cannot be empty")
+    if len(v) > NAME_MAX_LENGTH:
+        raise ValueError(f"Name must be at most {NAME_MAX_LENGTH} characters")
+    return v
+
+
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     role: str = "user"  # "user" | "admin"
+    name: Optional[str] = None
 
     @field_validator("role")
     @classmethod
@@ -149,6 +172,11 @@ class RegisterRequest(BaseModel):
     def validate_password(cls, v: str) -> str:
         return _validate_password_length(v)
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_name(v)
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
@@ -159,12 +187,36 @@ class TokenResponse(BaseModel):
     user_id: str
     email: str
     role: str
+    name: Optional[str] = None
 
 class UserRecord(BaseModel):
     user_id: str
     email: str
     role: str
     is_active: bool
+    name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class UpdateProfileRequest(BaseModel):
+    name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    remove_avatar: bool = False  # explicit signal to clear avatar_url — None on avatar_url just means "leave as-is"
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_name(v)
+
+    @field_validator("avatar_url")
+    @classmethod
+    def validate_avatar_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not v.startswith("data:image/"):
+            raise ValueError("Avatar must be an image data URL")
+        if len(v) > 500_000:
+            raise ValueError("Avatar image is too large")
+        return v
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
@@ -176,13 +228,41 @@ class ChangePasswordRequest(BaseModel):
         return _validate_password_length(v)
 
 class AdminResetRequest(BaseModel):
-    email: EmailStr
+    user_id: str
     new_password: str
 
     @field_validator("new_password")
     @classmethod
     def validate_new_password(cls, v: str) -> str:
         return _validate_password_length(v)
+
+
+class AdminCreateUserRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        return _validate_password_length(v)
+
+
+class AdminUserStatusRequest(BaseModel):
+    user_id: str
+    active: bool
+
+
+class TeamMember(BaseModel):
+    user_id: str
+    email: str
+    role: str
+    is_active: bool
+    created_at: datetime
+
+
+class TeamMembersResponse(BaseModel):
+    members: list[TeamMember]
+    max_sub_users: int
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +303,17 @@ def _ensure_users_table(conn):
                     created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
                     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
                 );
-                CREATE INDEX IF NOT EXISTS idx_users_email   ON users (email);
-                CREATE INDEX IF NOT EXISTS idx_users_user_id ON users (user_id);
+                ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS created_by TEXT;
+                ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS max_sub_users INTEGER NOT NULL DEFAULT 5;
+                ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS name TEXT;
+                ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+                CREATE INDEX IF NOT EXISTS idx_users_email      ON users (email);
+                CREATE INDEX IF NOT EXISTS idx_users_user_id    ON users (user_id);
+                CREATE INDEX IF NOT EXISTS idx_users_created_by ON users (created_by);
             """)
     except Exception as e:
         logger.warning("auth: ensure users table failed: %s", e)
@@ -234,10 +323,12 @@ def _ensure_users_table(conn):
 # JWT helpers
 # ---------------------------------------------------------------------------
 
-def _create_token(user_id: str, email: str, role: str) -> str:
+def _create_token(user_id: str, email: str, role: str, name: Optional[str] = None) -> str:
     jwt = _jose()
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {"sub": user_id, "email": email, "role": role, "exp": expire}
+    if name:
+        payload["name"] = name
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -331,10 +422,10 @@ async def register(body: RegisterRequest):
             hashed  = _hash_password(pwd_ctx, body.password)
 
             cur.execute("""
-                INSERT INTO users (user_id, email, password_hash, role)
-                VALUES (%s, %s, %s, %s)
-                RETURNING user_id, email, role
-            """, (user_id, body.email, hashed, role))
+                INSERT INTO users (user_id, email, password_hash, role, name)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING user_id, email, role, name
+            """, (user_id, body.email, hashed, role, body.name))
             row = cur.fetchone()
     except HTTPException:
         raise
@@ -344,12 +435,13 @@ async def register(body: RegisterRequest):
     finally:
         conn.close()
 
-    token = _create_token(row["user_id"], row["email"], row["role"])
+    token = _create_token(row["user_id"], row["email"], row["role"], row["name"])
     return TokenResponse(
         access_token=token,
         user_id=row["user_id"],
         email=row["email"],
         role=row["role"],
+        name=row["name"],
     )
 
 
@@ -369,7 +461,7 @@ async def login(body: LoginRequest, request: Request):
         _ensure_users_table(conn)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT user_id, email, password_hash, role, is_active FROM users WHERE email = %s",
+                "SELECT user_id, email, password_hash, role, is_active, name FROM users WHERE email = %s",
                 (body.email,)
             )
             row = cur.fetchone()
@@ -392,19 +484,77 @@ async def login(body: LoginRequest, request: Request):
         raise HTTPException(status_code=403, detail="Account is disabled")
 
     _clear_failed_logins(rl_key)
-    token = _create_token(row["user_id"], row["email"], row["role"])
+    token = _create_token(row["user_id"], row["email"], row["role"], row["name"])
     return TokenResponse(
         access_token=token,
         user_id=row["user_id"],
         email=row["email"],
         role=row["role"],
+        name=row["name"],
     )
 
 
 @router.get("/auth/me", response_model=UserRecord)
 async def me(user: UserRecord = Depends(get_current_user)):
-    """Return the currently authenticated user."""
-    return user
+    """Return the current user's full profile, refreshed from the DB — the
+    JWT alone doesn't carry avatar_url and its is_active claim can go stale."""
+    conn = _get_conn()
+    if not conn:
+        return user
+    try:
+        _ensure_users_table(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, email, role, is_active, name, avatar_url FROM users WHERE user_id = %s",
+                (user.user_id,),
+            )
+            row = cur.fetchone()
+        return UserRecord(**row) if row else user
+    finally:
+        conn.close()
+
+
+@router.post("/auth/me", response_model=UserRecord)
+async def update_profile(
+    body: UpdateProfileRequest,
+    user: UserRecord = Depends(get_current_user),
+):
+    """Update the current user's display name and/or avatar. Pass
+    remove_avatar=true to clear the avatar back to the initials fallback."""
+    if body.name is None and body.avatar_url is None and not body.remove_avatar:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    conn = _get_conn()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        _ensure_users_table(conn)
+        set_clauses = []
+        params = []
+        if body.name is not None:
+            set_clauses.append("name = %s")
+            params.append(body.name)
+        if body.remove_avatar:
+            set_clauses.append("avatar_url = NULL")
+        elif body.avatar_url is not None:
+            set_clauses.append("avatar_url = %s")
+            params.append(body.avatar_url)
+        set_clauses.append("updated_at = now()")
+        params.append(user.user_id)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE users SET {', '.join(set_clauses)} WHERE user_id = %s "
+                f"RETURNING user_id, email, role, is_active, name, avatar_url",
+                params,
+            )
+            row = cur.fetchone()
+        return UserRecord(**row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("update_profile error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to update profile: {e}")
+    finally:
+        conn.close()
 
 
 @router.post("/auth/change-password", status_code=200)
@@ -444,30 +594,152 @@ async def change_password(
 @router.post("/auth/admin/reset-password", status_code=200)
 async def admin_reset_password(
     body: AdminResetRequest,
-    _: UserRecord = Depends(require_role("admin")),
+    admin: UserRecord = Depends(require_role("admin")),
 ):
-    """Admin-only: reset any user's password by email."""
+    """Admin-only: reset a team member's password. Scoped to created_by =
+    admin.user_id — an admin can only reset passwords for members they
+    created themselves, not any arbitrary user in the system."""
     pwd_ctx = _passlib()
     conn = _get_conn()
     if not conn:
         raise HTTPException(status_code=503, detail="Database unavailable")
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM users WHERE email = %s", (body.email,))
+            cur.execute(
+                "SELECT user_id, email FROM users WHERE user_id = %s AND created_by = %s",
+                (body.user_id, admin.user_id),
+            )
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=404, detail="User not found")
+                raise HTTPException(status_code=404, detail="Team member not found")
             new_hash = _hash_password(pwd_ctx, body.new_password)
             cur.execute(
-                "UPDATE users SET password_hash = %s, updated_at = now() WHERE email = %s",
-                (new_hash, body.email)
+                "UPDATE users SET password_hash = %s, updated_at = now() WHERE user_id = %s",
+                (new_hash, body.user_id)
             )
-        return {"message": f"Password reset for {body.email}"}
+        return {"message": f"Password reset for {row['email']}"}
     except HTTPException:
         raise
     except Exception as e:
         logger.error("admin_reset_password error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to reset password: {e}")
+    finally:
+        conn.close()
+
+
+@router.get("/auth/admin/users", response_model=TeamMembersResponse)
+async def list_admin_users(admin: UserRecord = Depends(require_role("admin"))):
+    """Admin-only: list the team members this admin has added, plus their quota."""
+    conn = _get_conn()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        _ensure_users_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT max_sub_users FROM users WHERE user_id = %s", (admin.user_id,))
+            admin_row = cur.fetchone()
+            max_sub_users = admin_row["max_sub_users"] if admin_row else 0
+
+            cur.execute(
+                """
+                SELECT user_id, email, role, is_active, created_at
+                FROM users WHERE created_by = %s ORDER BY created_at DESC
+                """,
+                (admin.user_id,),
+            )
+            members = cur.fetchall()
+        return TeamMembersResponse(members=members, max_sub_users=max_sub_users)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("list_admin_users error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list team members: {e}")
+    finally:
+        conn.close()
+
+
+@router.post("/auth/admin/users", response_model=TeamMember, status_code=201)
+async def add_admin_user(
+    body: AdminCreateUserRequest,
+    admin: UserRecord = Depends(require_role("admin")),
+):
+    """Admin-only: add a team member under this admin, capped by max_sub_users. New members always get role 'user'."""
+    pwd_ctx = _passlib()
+    conn = _get_conn()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        _ensure_users_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM users WHERE email = %s", (body.email,))
+            if cur.fetchone():
+                raise HTTPException(status_code=409, detail="Email already registered")
+
+            cur.execute("SELECT max_sub_users FROM users WHERE user_id = %s", (admin.user_id,))
+            admin_row = cur.fetchone()
+            max_sub_users = admin_row["max_sub_users"] if admin_row else 0
+
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM users WHERE created_by = %s AND is_active = true",
+                (admin.user_id,),
+            )
+            current_count = cur.fetchone()["cnt"]
+            if current_count >= max_sub_users:
+                raise HTTPException(status_code=403, detail="Team member limit reached")
+
+            user_id = str(uuid.uuid4())
+            hashed = _hash_password(pwd_ctx, body.password)
+            cur.execute(
+                """
+                INSERT INTO users (user_id, email, password_hash, role, created_by)
+                VALUES (%s, %s, %s, 'user', %s)
+                RETURNING user_id, email, role, is_active, created_at
+                """,
+                (user_id, body.email, hashed, admin.user_id),
+            )
+            row = cur.fetchone()
+        return TeamMember(**row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("add_admin_user error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to add team member: {e}")
+    finally:
+        conn.close()
+
+
+@router.post("/auth/admin/users/activate")
+async def set_admin_user_status(
+    body: AdminUserStatusRequest,
+    admin: UserRecord = Depends(require_role("admin")),
+):
+    """Admin-only: activate/deactivate a team member this admin created.
+    Scoped to created_by = admin.user_id, so an admin can never touch a
+    member outside their own team (and can never deactivate themselves,
+    since their own row has no created_by pointing at themselves)."""
+    conn = _get_conn()
+    if not conn:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        _ensure_users_table(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id FROM users WHERE user_id = %s AND created_by = %s",
+                (body.user_id, admin.user_id),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Team member not found")
+
+            cur.execute(
+                "UPDATE users SET is_active = %s, updated_at = now() WHERE user_id = %s",
+                (body.active, body.user_id),
+            )
+        return {"status": "success", "user_id": body.user_id, "active": body.active}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("set_admin_user_status error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to update team member: {e}")
     finally:
         conn.close()
 
