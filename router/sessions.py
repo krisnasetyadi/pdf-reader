@@ -277,7 +277,15 @@ async def list_sessions(
         search_clause = ""
         params: tuple = ()
         if q:
-            pattern = f"%{q.replace('%', chr(92) + '%').replace('_', chr(92) + '_')}%"
+            # Escape backslashes first — ILIKE's default escape char is `\`,
+            # so an unescaped literal backslash in the query would otherwise
+            # consume the next character (including the wildcards we add).
+            escaped = (
+                q.replace(chr(92), chr(92) * 2)
+                .replace("%", chr(92) + "%")
+                .replace("_", chr(92) + "_")
+            )
+            pattern = f"%{escaped}%"
             search_clause = """
                 AND (
                     s.title ILIKE %s
