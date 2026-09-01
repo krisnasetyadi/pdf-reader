@@ -9,13 +9,16 @@ Schema (two tables):
 Falls back to in-memory dict if DATABASE_URL is not set or DB is unreachable.
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone
 import logging
 import uuid
 import os
+
+# MS-237: how many messages GET /sessions/{id} returns per page.
+PAGE_SIZE_DEFAULT = 5
 
 from router.auth import get_current_user, UserRecord
 
@@ -51,6 +54,15 @@ class SessionResponse(BaseModel):
     messages: List[StoredMessage]
     pdf_collections: List[str]
     chat_collections: List[str]
+    # MS-237: only meaningful on the paginated GET below. POST (create/
+    # update) always returns the full list it was given, so has_more is
+    # correctly False there too — nothing more to page in.
+    has_more: bool = False
+    next_cursor: Optional[str] = None
+    # Total user-authored messages in the session (loaded or not) — lets the
+    # client draw one navigation marker per question, including ones it
+    # hasn't fetched yet.
+    total_user_turns: int = 0
 
 class SessionSummary(BaseModel):
     session_id: str
@@ -154,6 +166,18 @@ def _get_required_conn():
     return conn
 
 
+def _parse_cursor(cursor: Optional[str]):
+    """"<created_at ISO>|<row id>" -> (created_at, id), or (None, None) if
+    absent/malformed — callers treat that as "start from the most recent"."""
+    if not cursor:
+        return None, None
+    try:
+        ts_str, id_str = cursor.rsplit("|", 1)
+        return ts_str, int(id_str)
+    except Exception:
+        return None, None
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -250,6 +274,7 @@ async def upsert_session(
             ],
             pdf_collections=list(session_row["pdf_collections"] or []),
             chat_collections=list(session_row["chat_collections"] or []),
+            total_user_turns=sum(1 for r in msg_rows if r["role"] == "user"),
         )
     except Exception as e:
         logger.error("sessions upsert DB error: %s", e)
@@ -325,8 +350,17 @@ async def list_sessions(user: UserRecord = Depends(get_current_user)):
 
 
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str, user: UserRecord = Depends(get_current_user)):
-    """Return full session including all messages from chat_messages table."""
+async def get_session(
+    session_id: str,
+    limit: int = Query(PAGE_SIZE_DEFAULT, ge=1, le=100),
+    before: Optional[str] = None,
+    user: UserRecord = Depends(get_current_user),
+):
+    """Return a session's most recent `limit` messages, newest page first —
+    MS-237: was "all messages, always"; a long-lived conversation no longer
+    dumps its entire history into one response. Pass the previous response's
+    `next_cursor` as `before` to page further back; `has_more`/`next_cursor`
+    come back falsy once the start of the conversation is reached."""
     conn = _get_required_conn()
     try:
         with conn.cursor() as cur:
@@ -345,13 +379,45 @@ async def get_session(session_id: str, user: UserRecord = Depends(get_current_us
             ):
                 raise HTTPException(status_code=403, detail="Not allowed to access this session")
 
-            cur.execute("""
-                SELECT message_id, role, content, model_used, created_at
-                FROM chat_messages
-                WHERE session_id = %s
-                ORDER BY created_at ASC, id ASC
-            """, (session_id,))
+            before_ts, before_id = _parse_cursor(before)
+            if before_ts is not None and before_id is not None:
+                cur.execute("""
+                    SELECT message_id, role, content, model_used, created_at, id
+                    FROM chat_messages
+                    WHERE session_id = %s
+                      AND (created_at, id) < (%s, %s)
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                """, (session_id, before_ts, before_id, limit + 1))
+            else:
+                cur.execute("""
+                    SELECT message_id, role, content, model_used, created_at, id
+                    FROM chat_messages
+                    WHERE session_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                """, (session_id, limit + 1))
             msg_rows = cur.fetchall()
+
+            # Needed so the client can draw a navigation marker for every
+            # question ever asked in this session, including ones it hasn't
+            # paged in yet (MS-237 poin 9: click an unloaded marker -> fetch
+            # the pages between here and there, then scroll to it).
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM chat_messages WHERE session_id = %s AND role = 'user'",
+                (session_id,),
+            )
+            total_user_turns = int(cur.fetchone()["n"] or 0)
+
+        has_more = len(msg_rows) > limit
+        msg_rows = msg_rows[:limit]
+        msg_rows.reverse()  # DESC (newest first, for the LIMIT) -> ASC for the response
+
+        next_cursor = None
+        if has_more and msg_rows:
+            oldest = msg_rows[0]
+            next_cursor = f"{_ts(oldest['created_at'])}|{oldest['id']}"
+
         return SessionResponse(
             session_id=session_row["session_id"],
             title=session_row["title"],
@@ -369,6 +435,9 @@ async def get_session(session_id: str, user: UserRecord = Depends(get_current_us
             ],
             pdf_collections=list(session_row["pdf_collections"] or []),
             chat_collections=list(session_row["chat_collections"] or []),
+            has_more=has_more,
+            next_cursor=next_cursor,
+            total_user_turns=total_user_turns,
         )
     except HTTPException:
         raise
