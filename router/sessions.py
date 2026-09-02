@@ -17,8 +17,17 @@ import logging
 import uuid
 import os
 
-# MS-237: how many messages GET /sessions/{id} returns per page.
+# MS-237: how many *chats* GET /sessions/{id} returns per page. One chat is
+# one question plus the answer(s) that followed it — not one message row — so
+# a page never lands mid-exchange with a question whose answer is still on the
+# next page.
 PAGE_SIZE_DEFAULT = 5
+
+# MS-237: how many questions the navigation index below returns at most. It's
+# a flat list the client holds in memory for the hover panel, so it can't be
+# unbounded; past this the newest ones are the ones worth keeping (turn
+# numbers stay absolute, so the panel still labels them correctly).
+QUESTION_INDEX_LIMIT = 1000
 
 from router.auth import get_current_user, UserRecord
 
@@ -72,6 +81,20 @@ class SessionSummary(BaseModel):
     updated_at: str
     pdf_collections: List[str]
     chat_collections: List[str]
+
+class SessionQuestion(BaseModel):
+    """One entry in the navigation index — a question the user asked, with
+    just enough text to recognise it in a list."""
+    turn: int          # 1-based, counted from the start of the session
+    message_id: str
+    preview: str
+
+
+class SessionQuestionsResponse(BaseModel):
+    session_id: str
+    total: int         # every question in the session, even beyond the cap below
+    questions: List[SessionQuestion]
+
 
 class RenameSessionRequest(BaseModel):
     title: str
@@ -356,11 +379,13 @@ async def get_session(
     before: Optional[str] = None,
     user: UserRecord = Depends(get_current_user),
 ):
-    """Return a session's most recent `limit` messages, newest page first —
-    MS-237: was "all messages, always"; a long-lived conversation no longer
-    dumps its entire history into one response. Pass the previous response's
-    `next_cursor` as `before` to page further back; `has_more`/`next_cursor`
-    come back falsy once the start of the conversation is reached."""
+    """Return a session's most recent `limit` chats — one chat being one
+    question plus the answer(s) that followed it, so `limit=5` is 5 complete
+    exchanges, not 5 message rows. MS-237: was "all messages, always"; a
+    long-lived conversation no longer dumps its entire history into one
+    response. Pass the previous response's `next_cursor` as `before` to page
+    further back; `has_more`/`next_cursor` come back falsy once the start of
+    the conversation is reached."""
     conn = _get_required_conn()
     try:
         with conn.cursor() as cur:
@@ -379,25 +404,55 @@ async def get_session(
             ):
                 raise HTTPException(status_code=403, detail="Not allowed to access this session")
 
+            # Page by chat, not by message row: number every message with a
+            # running count of the questions asked up to and including it
+            # (`chat_no`), then keep only the last `limit` of those numbers.
+            # A question and the answer(s) that followed it share one
+            # chat_no, so they always travel together — a plain
+            # "LIMIT 5 rows" would cut between them and strand an answer
+            # without its question (or vice versa) on the page boundary.
             before_ts, before_id = _parse_cursor(before)
+            chat_page_sql = """
+                WITH ordered AS (
+                    SELECT message_id, role, content, model_used, created_at, id,
+                           SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END)
+                               OVER (ORDER BY created_at ASC, id ASC) AS chat_no
+                    FROM chat_messages
+                    WHERE session_id = %s
+                    {cursor_clause}
+                )
+                SELECT message_id, role, content, model_used, created_at, id
+                FROM ordered
+                WHERE chat_no > (SELECT COALESCE(MAX(chat_no), 0) FROM ordered) - %s
+                ORDER BY created_at ASC, id ASC
+            """
             if before_ts is not None and before_id is not None:
-                cur.execute("""
-                    SELECT message_id, role, content, model_used, created_at, id
-                    FROM chat_messages
-                    WHERE session_id = %s
-                      AND (created_at, id) < (%s, %s)
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT %s
-                """, (session_id, before_ts, before_id, limit + 1))
+                cur.execute(
+                    chat_page_sql.format(cursor_clause="AND (created_at, id) < (%s, %s)"),
+                    (session_id, before_ts, before_id, limit),
+                )
             else:
-                cur.execute("""
-                    SELECT message_id, role, content, model_used, created_at, id
-                    FROM chat_messages
-                    WHERE session_id = %s
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT %s
-                """, (session_id, limit + 1))
+                cur.execute(
+                    chat_page_sql.format(cursor_clause=""),
+                    (session_id, limit),
+                )
             msg_rows = cur.fetchall()
+
+            # Anything still older than the page we just built means there's
+            # another page behind it. Asked as its own EXISTS rather than
+            # over-fetching a row, since the page size is counted in chats
+            # and a "+1 row" trick can't tell a whole extra chat from the
+            # tail of the current one.
+            has_more = False
+            if msg_rows:
+                oldest = msg_rows[0]
+                cur.execute("""
+                    SELECT EXISTS(
+                        SELECT 1 FROM chat_messages
+                        WHERE session_id = %s AND (created_at, id) < (%s, %s)
+                    ) AS more
+                """, (session_id, oldest["created_at"], oldest["id"]))
+                has_more = bool(cur.fetchone()["more"])
 
             # Needed so the client can draw a navigation marker for every
             # question ever asked in this session, including ones it hasn't
@@ -408,10 +463,6 @@ async def get_session(
                 (session_id,),
             )
             total_user_turns = int(cur.fetchone()["n"] or 0)
-
-        has_more = len(msg_rows) > limit
-        msg_rows = msg_rows[:limit]
-        msg_rows.reverse()  # DESC (newest first, for the LIMIT) -> ASC for the response
 
         next_cursor = None
         if has_more and msg_rows:
@@ -444,6 +495,85 @@ async def get_session(
     except Exception as e:
         logger.error("sessions get DB error: %s", e)
         raise HTTPException(status_code=500, detail="Failed to load session")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@router.get("/sessions/{session_id}/questions", response_model=SessionQuestionsResponse)
+async def get_session_questions(
+    session_id: str,
+    user: UserRecord = Depends(get_current_user),
+):
+    """Every question asked in this session, as a flat index: turn number,
+    the message id to scroll to, and a short preview.
+
+    MS-237: this backs the chat navigation panel, which lists the whole
+    conversation while the thread itself is still paginated 5 chats at a
+    time. Content is truncated in SQL so the response stays small no matter
+    how long the individual messages are — the panel only ever shows one
+    line per question."""
+    conn = _get_required_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT session_id, owner_id FROM chat_sessions WHERE session_id = %s",
+                (session_id,),
+            )
+            session_row = cur.fetchone()
+            if not session_row:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if (
+                user.role != "admin"
+                and session_row.get("owner_id")
+                and session_row["owner_id"] != user.user_id
+            ):
+                raise HTTPException(status_code=403, detail="Not allowed to access this session")
+
+            # Numbered over the whole session first, then cut to the newest
+            # QUESTION_INDEX_LIMIT — so a capped response still reports each
+            # question's real turn number rather than renumbering from 1.
+            cur.execute("""
+                WITH numbered AS (
+                    SELECT message_id,
+                           LEFT(content, 120) AS preview,
+                           ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS turn,
+                           created_at, id
+                    FROM chat_messages
+                    WHERE session_id = %s AND role = 'user'
+                )
+                SELECT message_id, preview, turn FROM (
+                    SELECT * FROM numbered ORDER BY created_at DESC, id DESC LIMIT %s
+                ) newest
+                ORDER BY turn ASC
+            """, (session_id, QUESTION_INDEX_LIMIT))
+            rows = cur.fetchall()
+
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM chat_messages WHERE session_id = %s AND role = 'user'",
+                (session_id,),
+            )
+            total = int(cur.fetchone()["n"] or 0)
+
+        return SessionQuestionsResponse(
+            session_id=session_id,
+            total=total,
+            questions=[
+                SessionQuestion(
+                    turn=int(r["turn"]),
+                    message_id=r["message_id"],
+                    preview=r["preview"] or "",
+                )
+                for r in rows
+            ],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("sessions questions DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to load session questions")
     finally:
         try:
             conn.close()

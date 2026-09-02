@@ -2800,13 +2800,14 @@ Answer:"""
         else:
             prompt = self._build_general_prompt(context, question, conflicts, source_breakdown, sole_source_type=sole_source_type)
 
-        # MS-237 poin 1: prepend the previous-5-messages window so a
+        # MS-237 poin 1: prepend the previous-5-chats window (a chat being
+        # one question plus its answer) so a
         # follow-up like "ringkas semua di atas" or "yang tadi" has
         # something to resolve against. Prepended to the finished `prompt`
         # (not folded into `context` above) so it stands on its own instead
         # of reading as part of the "DOKUMEN:" section every builder wraps
         # context in. Caller (router/agnostic.py) has already clamped
-        # `memory` to 5 short turns — this only formats it.
+        # `memory` to the last 5 chats — this only formats it.
         if memory:
             history_lines = [
                 f"{'User' if turn.get('role') == 'user' else 'Asisten'}: {turn.get('content', '')}"

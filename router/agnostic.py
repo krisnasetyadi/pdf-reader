@@ -29,8 +29,12 @@ router = APIRouter(tags=["agnostic"])
 
 # MS-237 poin 1: hard cap on the client-sent conversation-history window,
 # applied here regardless of what the client actually sends — a client that
-# sends 200 messages must not be able to balloon the prompt/token cost.
-MAX_MEMORY_TURNS = 5
+# sends 200 messages must not be able to balloon the prompt/token cost. The
+# window is counted in *chats* (one question plus the answer that followed
+# it), so 5 chats is up to ~10 messages; MAX_MEMORY_MESSAGES is the backstop
+# for a caller that pads one chat with a hundred assistant turns.
+MAX_MEMORY_CHATS = 5
+MAX_MEMORY_MESSAGES = MAX_MEMORY_CHATS * 4
 MAX_MEMORY_CHARS = 600
 
 
@@ -264,12 +268,20 @@ async def agnostic_query(
         )
 
         # MS-237: clamp the client's conversation-history window before it
-        # ever reaches the prompt — see MAX_MEMORY_* above.
+        # ever reaches the prompt — see MAX_MEMORY_* above. Cut at the start
+        # of the 5th-from-last question rather than at a raw message count,
+        # so every remembered question keeps the answer that belongs to it.
         memory_payload: Optional[List[Dict[str, str]]] = None
         if req.memory:
+            question_at = [i for i, m in enumerate(req.memory) if m.role == "user"]
+            start = (
+                question_at[-MAX_MEMORY_CHATS]
+                if len(question_at) > MAX_MEMORY_CHATS
+                else 0
+            )
             memory_payload = [
                 {"role": m.role, "content": m.content[:MAX_MEMORY_CHARS]}
-                for m in req.memory[-MAX_MEMORY_TURNS:]
+                for m in req.memory[start:][-MAX_MEMORY_MESSAGES:]
             ]
 
         # Generate answer
