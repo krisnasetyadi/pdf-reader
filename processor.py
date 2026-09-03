@@ -46,6 +46,16 @@ OFF_TOPIC_INSTRUCTION_ID = (
 )
 
 
+def _extract_total_tokens(llm_result) -> int:
+    """Gemini's usage_metadata rides along on the returned AIMessage for free
+    (langchain_google_genai maps it from the raw API response) — pull the
+    total out of it so callers can meter consumption without a second round
+    trip. Local/free fallback models (HuggingFace) don't set this, so this
+    returns 0 for them, which is correct — there's no API cost to log."""
+    usage_metadata = getattr(llm_result, 'usage_metadata', None) or {}
+    return usage_metadata.get('total_tokens', 0) if isinstance(usage_metadata, dict) else 0
+
+
 class PDFQAProcessor:
     def __init__(self):
         self.llm = None
@@ -2802,11 +2812,17 @@ Answer:"""
         try:
             result = llm.invoke(prompt)
             answer = result.content.strip() if hasattr(result, 'content') else str(result).strip()
-            
+            total_tokens = _extract_total_tokens(result)
+            # Raw shape straight off the LLM response — proof this number comes
+            # from Gemini's own usage_metadata (langchain_google_genai just
+            # relays prompt_token_count/candidates_token_count/total_token_count
+            # into this dict), not something we or LangChain compute ourselves.
+            logger.info("LLM usage_metadata: %s", getattr(result, 'usage_metadata', None))
+
             # Validasi dan post-processing
             answer = self._validate_and_clean_answer(answer, question, merged_results)
             processing_steps.append("Answer validated and cleaned")
-            
+
             # Generate comprehensive metadata untuk response
             answer_metadata = {
                 "confidence_score": merged_results[0]['confidence'] if merged_results else 0,
@@ -2821,9 +2837,10 @@ Answer:"""
                 "total_results_processed": len(merged_results),
                 "conflict_details": conflicts if conflicts else [],
                 "model_used": model_id,
-                "is_person_query": is_person_query
+                "is_person_query": is_person_query,
+                "total_tokens": total_tokens
             }
-            
+
             return answer, model_id, answer_metadata
             
         except Exception as e:
@@ -3062,13 +3079,17 @@ JAWABAN:"""
                 pass
         return []
 
-    def extract_framework_items(self, reference_collection_ids: List[str], framework_name: str) -> List[str]:
+    def extract_framework_items(
+        self, reference_collection_ids: List[str], framework_name: str
+    ) -> Tuple[List[str], int]:
         """Ask the LLM to enumerate discrete requirement/control items from the
         reference collection(s). Generic — works for any standard/framework
-        the user uploads, not just ISO."""
+        the user uploads, not just ISO. Returns (items, tokens_consumed) —
+        the caller is responsible for metering/enforcement (MS-248), this
+        function just reports what it spent."""
         reference_text = self._get_reference_text(reference_collection_ids)
         if not reference_text.strip():
-            return []
+            return [], 0
 
         prompt = f"""Anda membaca dokumen standar/framework bernama "{framework_name}".
 
@@ -3084,9 +3105,11 @@ JSON:"""
 
         llm, _ = self.get_llm(provider="gemini")
         raw = ""
+        tokens_consumed = 0
         try:
             result = llm.invoke(prompt)
             raw = result.content.strip() if hasattr(result, 'content') else str(result).strip()
+            tokens_consumed += _extract_total_tokens(result)
             items = self._parse_json_list(raw)
         except Exception as e:
             logger.error(f"extract_framework_items failed: {e}")
@@ -3104,6 +3127,7 @@ JSON:"""
                 retry_prompt = prompt + "\n\nPERHATIAN: balas HANYA dengan JSON array of string yang valid, tanpa teks lain, tanpa markdown fence."
                 result = llm.invoke(retry_prompt)
                 raw = result.content.strip() if hasattr(result, 'content') else str(result).strip()
+                tokens_consumed += _extract_total_tokens(result)
                 items = self._parse_json_list(raw)
             except Exception as e:
                 logger.error(f"extract_framework_items retry failed: {e}")
@@ -3113,7 +3137,7 @@ JSON:"""
                     f"extract_framework_items: retry also returned no items; "
                     f"raw response (first 500 chars): {raw[:500]!r}"
                 )
-        return items
+        return items, tokens_consumed
 
     def _build_gap_check_batch_prompt(self, framework_name: str, batch_items: List[Dict[str, str]]) -> str:
         """batch_items: list of {"label": ..., "target_context": ...}. Generic
@@ -3147,7 +3171,7 @@ JSON:"""
         reference_collection_ids: List[str],
         target_collection_ids: List[str],
         framework_name: str,
-    ) -> Tuple[List[Dict[str, Any]], str]:
+    ) -> Tuple[List[Dict[str, Any]], str, int]:
         """Skill 1 — Compliance Gap Check. Generic map-per-batch orchestration
         (not an autonomous agent): extract reference items ONCE, then check
         each target collection independently against that same item list —
@@ -3155,22 +3179,25 @@ JSON:"""
         each item comes back tagged with which file/collection it was
         checked against, instead of one merged verdict across all of them.
         Batches (item groups x target collections) run concurrently.
-        Returns (items, disclaimer)."""
-        items_labels = self.extract_framework_items(reference_collection_ids, framework_name)
+        Returns (items, disclaimer, tokens_consumed) — like
+        extract_framework_items, metering/enforcement is the caller's job
+        (MS-248); this just reports the total Gemini spend for the run."""
+        items_labels, tokens_consumed = self.extract_framework_items(reference_collection_ids, framework_name)
         disclaimer = (
             f"Analisis ini berdasarkan dokumen \"{framework_name}\" yang diupload sebagai referensi "
             "— kemungkinan ringkasan/interpretasi pihak ketiga, bukan teks standar resmi berlisensi. "
             "Hasil ini bersifat bantuan awal, bukan audit/sertifikasi resmi."
         )
         if not items_labels:
-            return [], disclaimer
+            return [], disclaimer, tokens_consumed
 
         batches = [
             items_labels[i:i + self.GAP_CHECK_BATCH_SIZE]
             for i in range(0, len(items_labels), self.GAP_CHECK_BATCH_SIZE)
         ]
 
-        def process_batch(batch_labels: List[str], target_collection_id: str) -> List[Dict[str, Any]]:
+        def process_batch(batch_labels: List[str], target_collection_id: str) -> Tuple[List[Dict[str, Any]], int]:
+            batch_tokens = 0
             batch_items = []
             for label in batch_labels:
                 try:
@@ -3203,6 +3230,7 @@ JSON:"""
             try:
                 result = llm.invoke(prompt)
                 raw = result.content.strip() if hasattr(result, 'content') else str(result).strip()
+                batch_tokens += _extract_total_tokens(result)
                 parsed = self._parse_json_objects(raw)
             except Exception as e:
                 logger.error(f"gap-check batch LLM call failed: {e}")
@@ -3214,6 +3242,7 @@ JSON:"""
                     retry_prompt = prompt + "\n\nPERHATIAN: balas HANYA dengan JSON array yang valid, tanpa teks lain."
                     result = llm.invoke(retry_prompt)
                     raw = result.content.strip() if hasattr(result, 'content') else str(result).strip()
+                    batch_tokens += _extract_total_tokens(result)
                     parsed = self._parse_json_objects(raw)
                 except Exception as e:
                     logger.error(f"gap-check batch retry failed: {e}")
@@ -3234,7 +3263,7 @@ JSON:"""
                     "recommendation": match.get("recommendation") or None,
                     "target_collection_id": target_collection_id,
                 })
-            return out
+            return out, batch_tokens
 
         all_items: List[Dict[str, Any]] = []
         effective_workers = max(1, min(
@@ -3249,11 +3278,13 @@ JSON:"""
             ]
             for future in futures:
                 try:
-                    all_items.extend(future.result())
+                    batch_items_out, batch_tokens = future.result()
+                    all_items.extend(batch_items_out)
+                    tokens_consumed += batch_tokens
                 except Exception as e:
                     logger.error(f"gap-check batch future failed: {e}")
 
-        return all_items, disclaimer
+        return all_items, disclaimer, tokens_consumed
 
     def _validate_and_clean_answer(self, answer: str, question: str, results: List[Dict]) -> str:
         """Validate dan clean LLM answer"""
