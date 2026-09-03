@@ -262,14 +262,44 @@ async def upsert_session(
 
 
 @router.get("/sessions", response_model=List[SessionSummary])
-async def list_sessions(user: UserRecord = Depends(get_current_user)):
+async def list_sessions(
+    q: Optional[str] = None,
+    user: UserRecord = Depends(get_current_user),
+):
     """Return sessions owned by the current user (all sessions for admins),
-    ordered by most recent, with message counts."""
+    ordered by most recent, with message counts.
+
+    If `q` is given, also matches sessions whose title OR any message
+    content contains it (case-insensitive), not just the title.
+    """
     conn = _get_required_conn()
     try:
+        search_clause = ""
+        params: tuple = ()
+        if q:
+            # Escape backslashes first — ILIKE's default escape char is `\`,
+            # so an unescaped literal backslash in the query would otherwise
+            # consume the next character (including the wildcards we add).
+            escaped = (
+                q.replace(chr(92), chr(92) * 2)
+                .replace("%", chr(92) + "%")
+                .replace("_", chr(92) + "_")
+            )
+            pattern = f"%{escaped}%"
+            search_clause = """
+                AND (
+                    s.title ILIKE %s
+                    OR EXISTS (
+                        SELECT 1 FROM chat_messages cm
+                        WHERE cm.session_id = s.session_id AND cm.content ILIKE %s
+                    )
+                )
+            """
+            params = (pattern, pattern)
+
         with conn.cursor() as cur:
             if user.role == "admin":
-                cur.execute("""
+                cur.execute(f"""
                     SELECT s.session_id,
                            s.title,
                            s.pdf_collections,
@@ -279,13 +309,14 @@ async def list_sessions(user: UserRecord = Depends(get_current_user)):
                            COUNT(m.id) AS message_count
                     FROM chat_sessions s
                     LEFT JOIN chat_messages m ON m.session_id = s.session_id
+                    WHERE TRUE {search_clause}
                     GROUP BY s.session_id, s.title, s.pdf_collections,
                              s.chat_collections, s.created_at, s.updated_at
                     ORDER BY s.updated_at DESC
                     LIMIT 200
-                """)
+                """, params)
             else:
-                cur.execute("""
+                cur.execute(f"""
                     SELECT s.session_id,
                            s.title,
                            s.pdf_collections,
@@ -295,12 +326,12 @@ async def list_sessions(user: UserRecord = Depends(get_current_user)):
                            COUNT(m.id) AS message_count
                     FROM chat_sessions s
                     LEFT JOIN chat_messages m ON m.session_id = s.session_id
-                    WHERE s.owner_id = %s
+                    WHERE s.owner_id = %s {search_clause}
                     GROUP BY s.session_id, s.title, s.pdf_collections,
                              s.chat_collections, s.created_at, s.updated_at
                     ORDER BY s.updated_at DESC
                     LIMIT 200
-                """, (user.user_id,))
+                """, (user.user_id,) + params)
             rows = cur.fetchall()
         return [
             SessionSummary(
