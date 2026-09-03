@@ -92,6 +92,7 @@ from router.database_connections import router as database_connections_router
 from router.compliance import router as compliance_router
 from router.telegram import router as telegram_router
 from router.payment import router as payment_router
+from router.skills import router as skills_router
 
 app.include_router(auth_router, prefix="/api/v1")           # Auth & RBAC
 app.include_router(upload_router, prefix="/api/v1")         # PDF upload
@@ -105,6 +106,7 @@ app.include_router(database_connections_router, prefix="/api/v1")  # User-connec
 app.include_router(compliance_router, prefix="/api/v1")     # Reference Framework Gap Analysis (Skill)
 app.include_router(telegram_router, prefix="/api/v1")       # Telegram live chat connections
 app.include_router(payment_router, prefix="/api/v1")        # Dummy/test-mode Stripe payment flow
+app.include_router(skills_router, prefix="/api/v1")         # Uploaded skill instructions (MS-251)
 
 
 @app.get("/")

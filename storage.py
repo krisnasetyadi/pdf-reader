@@ -213,9 +213,28 @@ def ensure_schema():
                 );
                 CREATE INDEX IF NOT EXISTS idx_users_email   ON users (email);
                 CREATE INDEX IF NOT EXISTS idx_users_user_id ON users (user_id);
+
+                CREATE TABLE IF NOT EXISTS skills (
+                    id            BIGSERIAL   PRIMARY KEY,
+                    skill_id      TEXT        NOT NULL UNIQUE DEFAULT gen_random_uuid()::text,
+                    name          TEXT        NOT NULL,
+                    slash_command TEXT        NOT NULL,
+                    description   TEXT        NOT NULL DEFAULT '',
+                    instruction   TEXT        NOT NULL,
+                    scope         TEXT        NOT NULL DEFAULT 'personal'
+                                  CHECK (scope IN ('personal', 'team')),
+                    owner_id      TEXT        NOT NULL,
+                    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                -- owner_id leads the index: both visibility branches filter it by
+                -- equality, and scope only has two values so it barely narrows
+                -- anything on its own. Same shape as idx_gap_analysis_runs_owner.
+                CREATE INDEX IF NOT EXISTS idx_skills_owner_scope
+                    ON skills (owner_id, scope);
             """)
         conn.close()
-        logger.info("Schema ensured: pdf_collections, chat_collections, chat_sessions, chat_messages, gap_analysis_runs, gap_analysis_items.")
+        logger.info("Schema ensured: pdf_collections, chat_collections, chat_sessions, chat_messages, gap_analysis_runs, gap_analysis_items, skills.")
     except Exception as e:
         logger.warning("Auto-migration skipped (disk fallback): %s", e)
     _migration_done = True
@@ -834,6 +853,166 @@ def delete_gap_analysis_run(run_id: str) -> bool:
         return True
     except Exception as e:
         logger.warning("delete_gap_analysis_run failed for %s: %s", run_id, e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# skills — user-uploaded skill instructions (MS-251)
+# Visibility is derived, not stored: a "team" skill belongs to the admin who
+# uploaded it and is visible to every account that admin created
+# (users.created_by), so there is no separate assignment table to keep in sync.
+# ---------------------------------------------------------------------------
+
+def _team_admin_id(user_id: str, is_admin: bool) -> Optional[str]:
+    """Which admin's team skills this user can see: their own id if they are an
+    admin, otherwise users.created_by. Looked up rather than read off the JWT —
+    the token (router/auth.py) carries no created_by, and widening it would log
+    every active session out."""
+    if is_admin:
+        return user_id
+    conn = _db_conn()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT created_by FROM users WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+        conn.close()
+        return row["created_by"] if row else None
+    except Exception as e:
+        logger.warning("_team_admin_id failed for %s: %s", user_id, e)
+        return None
+
+
+def create_skill(
+    skill_id: str,
+    name: str,
+    slash_command: str,
+    instruction: str,
+    owner_id: str,
+    description: str = "",
+    scope: str = "personal",
+) -> bool:
+    ensure_schema()
+    conn = _db_conn()
+    if not conn:
+        logger.warning("create_skill: no DB connection, skipping insert")
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO skills
+                    (skill_id, name, slash_command, description, instruction, scope, owner_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (skill_id, name, slash_command, description, instruction, scope, owner_id))
+        conn.close()
+        logger.info("Created skill: %s (scope=%s, owner=%s)", skill_id, scope, owner_id)
+        return True
+    except Exception as e:
+        logger.warning("create_skill failed: %s", e)
+        return False
+
+
+def list_skills_for_user(user_id: str, is_admin: bool) -> List[Dict[str, Any]]:
+    """Skills this account may use: its own personal ones, plus the team skills
+    of the admin it belongs to."""
+    ensure_schema()
+    admin_id = _team_admin_id(user_id, is_admin)
+    conn = _db_conn()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT skill_id, name, slash_command, description, instruction,
+                       scope, owner_id, created_at, updated_at
+                FROM skills
+                WHERE (scope = 'personal' AND owner_id = %s)
+                   OR (scope = 'team' AND owner_id = %s)
+                ORDER BY created_at DESC
+            """, (user_id, admin_id))
+            rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("list_skills_for_user failed for %s: %s", user_id, e)
+        return []
+
+
+def get_skill_for_user(skill_id: str, user_id: str, is_admin: bool) -> Optional[Dict[str, Any]]:
+    """One skill, but only if this account may use it — same visibility rule as
+    list_skills_for_user. Returns None when it does not exist OR is not visible,
+    so callers cannot tell the two apart."""
+    ensure_schema()
+    admin_id = _team_admin_id(user_id, is_admin)
+    conn = _db_conn()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT skill_id, name, slash_command, description, instruction,
+                       scope, owner_id, created_at, updated_at
+                FROM skills
+                WHERE skill_id = %s
+                  AND ((scope = 'personal' AND owner_id = %s)
+                    OR (scope = 'team' AND owner_id = %s))
+            """, (skill_id, user_id, admin_id))
+            row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.warning("get_skill_for_user failed for %s: %s", skill_id, e)
+        return None
+
+
+def update_skill(skill_id: str, owner_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Partial update, owner-only. Returns the updated row, or None if the skill
+    does not exist or belongs to someone else."""
+    ensure_schema()
+    allowed = ("name", "slash_command", "description", "instruction", "scope")
+    sets = [(k, v) for k, v in fields.items() if k in allowed and v is not None]
+    if not sets:
+        return None
+    conn = _db_conn()
+    if not conn:
+        return None
+    try:
+        assignments = ", ".join(f"{k} = %s" for k, _ in sets)
+        params = [v for _, v in sets] + [skill_id, owner_id]
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE skills SET {assignments}, updated_at = now()
+                WHERE skill_id = %s AND owner_id = %s
+                RETURNING skill_id, name, slash_command, description, instruction,
+                          scope, owner_id, created_at, updated_at
+            """, params)
+            row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.warning("update_skill failed for %s: %s", skill_id, e)
+        return None
+
+
+def delete_skill(skill_id: str, owner_id: str) -> bool:
+    """Owner-only hard delete, matching how collections and gap-analysis runs are
+    removed. Returns False when nothing matched (missing, or not the owner)."""
+    ensure_schema()
+    conn = _db_conn()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM skills WHERE skill_id = %s AND owner_id = %s",
+                (skill_id, owner_id),
+            )
+            deleted = cur.rowcount
+        conn.close()
+        return deleted > 0
+    except Exception as e:
+        logger.warning("delete_skill failed for %s: %s", skill_id, e)
         return False
 
 
