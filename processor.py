@@ -2656,11 +2656,12 @@ Answer:"""
     
     # processor.py - perbaiki generate_hybrid_answer
     def generate_hybrid_answer(
-        self, 
-        hybrid_results: Dict[str, Any], 
+        self,
+        hybrid_results: Dict[str, Any],
         question: str,
         llm_provider: Optional[str] = None,
-        llm_model: Optional[str] = None
+        llm_model: Optional[str] = None,
+        memory: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Enhanced hybrid answer generation dengan conflict resolution and comprehensive metadata"""
         
@@ -2808,7 +2809,26 @@ Answer:"""
             prompt = self._build_explanation_prompt(context, question, conflicts, sole_source_type=sole_source_type)
         else:
             prompt = self._build_general_prompt(context, question, conflicts, source_breakdown, sole_source_type=sole_source_type)
-        
+
+        # MS-237 poin 1: prepend the previous-5-chats window (a chat being
+        # one question plus its answer) so a
+        # follow-up like "ringkas semua di atas" or "yang tadi" has
+        # something to resolve against. Prepended to the finished `prompt`
+        # (not folded into `context` above) so it stands on its own instead
+        # of reading as part of the "DOKUMEN:" section every builder wraps
+        # context in. Caller (router/agnostic.py) has already clamped
+        # `memory` to the last 5 chats — this only formats it.
+        if memory:
+            history_lines = [
+                f"{'User' if turn.get('role') == 'user' else 'Asisten'}: {turn.get('content', '')}"
+                for turn in memory
+            ]
+            history_block = (
+                "RIWAYAT PERCAKAPAN (untuk memahami rujukan seperti \"itu\"/\"yang tadi\"):\n"
+                + "\n".join(history_lines)
+            )
+            prompt = f"{history_block}\n\n{prompt}"
+
         try:
             result = llm.invoke(prompt)
             answer = result.content.strip() if hasattr(result, 'content') else str(result).strip()

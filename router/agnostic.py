@@ -35,17 +35,40 @@ from router.payment import (
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["agnostic"])
 
+# MS-237 poin 1: hard cap on the client-sent conversation-history window,
+# applied here regardless of what the client actually sends — a client that
+# sends 200 messages must not be able to balloon the prompt/token cost. The
+# window is counted in *chats* (one question plus the answer that followed
+# it), so 5 chats is up to ~10 messages; MAX_MEMORY_MESSAGES is the backstop
+# for a caller that pads one chat with a hundred assistant turns.
+MAX_MEMORY_CHATS = 5
+MAX_MEMORY_MESSAGES = MAX_MEMORY_CHATS * 4
+MAX_MEMORY_CHARS = 600
 
 
 # ---------------------------------------------------------------------------
 # Request schema
 # ---------------------------------------------------------------------------
 
+class MemoryTurn(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
 class AgnosticQueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
 
     # Kept for schema compatibility with HF Space / old clients — ignored locally.
     source: Optional[str] = Field(None)
+
+    # MS-237: which session this question belongs to (currently unused
+    # server-side — the client sends `memory` directly instead of us looking
+    # it up — kept so the contract already has it once that moves server-side).
+    session_id: Optional[str] = None
+    # Previous 5 messages so a follow-up like "ringkas semua di atas" has
+    # something to resolve against. Re-clamped below regardless of what the
+    # client sends.
+    memory: Optional[List[MemoryTurn]] = None
 
     include_pdf_results:  Optional[bool] = True
     # Legacy: queries THIS app's own fixed database (app management data, not
@@ -293,6 +316,23 @@ async def _run_metered_query(
         external_db_connections,
     )
 
+    # MS-237: clamp the client's conversation-history window before it
+    # ever reaches the prompt — see MAX_MEMORY_* above. Cut at the start
+    # of the 5th-from-last question rather than at a raw message count,
+    # so every remembered question keeps the answer that belongs to it.
+    memory_payload: Optional[List[Dict[str, str]]] = None
+    if req.memory:
+        question_at = [i for i, m in enumerate(req.memory) if m.role == "user"]
+        start = (
+            question_at[-MAX_MEMORY_CHATS]
+            if len(question_at) > MAX_MEMORY_CHATS
+            else 0
+        )
+        memory_payload = [
+            {"role": m.role, "content": m.content[:MAX_MEMORY_CHARS]}
+            for m in req.memory[start:][-MAX_MEMORY_MESSAGES:]
+        ]
+
     # Generate answer
     answer_result = await asyncio.to_thread(
         processor.generate_hybrid_answer,
@@ -300,6 +340,7 @@ async def _run_metered_query(
         req.question,
         req.llm_provider,
         req.llm_model,
+        memory_payload,
     )
 
     if isinstance(answer_result, tuple) and len(answer_result) >= 2:
