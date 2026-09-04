@@ -219,6 +219,37 @@ class Config(BaseSettings):
     # Used to build the Checkout success/cancel redirect URLs.
     frontend_url: str = Field(default="http://localhost:3008")
 
+    # Global per-user token rate limit (MS-248 follow-up) — a flat safety net
+    # against runaway Gemini billing, applied to every user the same way,
+    # independent of the per-member monthly allocation in router/payment.py.
+    # Sliding window: a user is blocked once the sum of their token_usage in
+    # the last rate_limit_window_hours reaches the cap, and unblocks
+    # gradually as old usage ages out of the window (see
+    # router/payment.py::_get_rate_limit_status). Both are env-overridable so
+    # they can be turned down for testing (e.g. a tiny cap + a short window)
+    # without a code change.
+    rate_limit_token_cap: int = Field(default=300_000)
+    rate_limit_window_hours: float = Field(default=24.0)
+    # Testing convenience: set RATE_LIMIT_WINDOW_MINUTES in .env to override
+    # rate_limit_window_hours with a small value (e.g. "2" for a 2-minute
+    # window) without doing decimal-hour math. Unset in production.
+    rate_limit_window_minutes: Optional[float] = Field(default=None)
+
+    # Free-tier token allowance per 30-day rolling period (MS-248 follow-up)
+    # — a workspace that's never paid still gets a real, enforced cap here
+    # instead of relying on the flat rate limit alone. chat-ui/lib/pricing-plans.ts
+    # advertises "20 queries/month" for Free as marketing copy; a real query
+    # in this app costs roughly 2,000-5,000 Gemini tokens depending on
+    # context size, so 60,000 tokens approximates that same budget without
+    # this app tracking query *count* anywhere.
+    free_plan_token_limit: int = Field(default=60_000)
+
+    @property
+    def effective_rate_limit_window_hours(self) -> float:
+        if self.rate_limit_window_minutes is not None:
+            return self.rate_limit_window_minutes / 60
+        return self.rate_limit_window_hours
+
     class Config:
         env_file = ".env"
         extra = 'ignore'

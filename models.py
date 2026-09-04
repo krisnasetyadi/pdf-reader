@@ -169,6 +169,95 @@ class PaymentResponse(BaseModel):
     payment: PaymentRecord
 
 
+# ===================== TOKEN USAGE & ALLOCATION (MS-248) =====================
+# Workspace-level subscription usage plus, on top of it, per-member token
+# allocations that an admin distributes out of the workspace's token_limit
+# (see router/payment.py for how these are computed/persisted).
+
+class SubscriptionUsage(BaseModel):
+    plan_name: str
+    subscription_status: str  # active | expired | none
+    token_limit: int
+    token_used: int
+    token_remaining: int
+    period_start: Union[str, datetime]
+    period_end: Union[str, datetime]
+    next_reset_date: Optional[Union[str, datetime]] = None
+    # True once the admin has cancelled — access still runs until period_end
+    # (already paid for), it just won't be treated as renewable after that.
+    cancel_at_period_end: bool = False
+    # False for the synthetic Free-tier plan (nobody's paid — see
+    # _get_latest_plan_window's fallback branch) — there's no purchase on
+    # file to cancel, so the frontend should hide cancel/resume for it.
+    is_paid: bool = True
+
+
+class MemberTokenUsage(BaseModel):
+    user_id: str
+    email: str
+    allocated_tokens: int
+    used_tokens: int
+    remaining_tokens: int
+    usage_percent: float
+
+
+class MyMemberUsageResponse(BaseModel):
+    usage: Optional[MemberTokenUsage] = None
+
+
+class MembersUsageResponse(BaseModel):
+    subscription: Optional[SubscriptionUsage] = None
+    members: List[MemberTokenUsage]
+    unallocated_tokens: int
+
+
+class UpdateMemberAllocationRequest(BaseModel):
+    user_id: str
+    allocated_tokens: int
+
+
+class UpdateMemberAllocationResponse(BaseModel):
+    member: MemberTokenUsage
+    unallocated_tokens: int
+
+
+# Flat, plan-independent safety-net rate limit (same for every user) — see
+# router/payment.py::_get_rate_limit_status. Separate from SubscriptionUsage
+# / MemberTokenUsage above, which track the per-plan/per-member allocation.
+class RateLimitStatus(BaseModel):
+    used_tokens: int
+    cap_tokens: int
+    window_hours: float
+    blocked: bool
+    reset_at: Optional[Union[str, datetime]] = None
+
+
+# "Request more tokens" (MS-248 follow-up) — in-app only (polled, not real
+# push). A member who hit their admin-assigned cap can ask for more; the
+# admin sees pending ones in the Billing tab, raises the cap themselves via
+# the existing allocation editor, then dismisses the request.
+class CreateTokenRequestRequest(BaseModel):
+    message: Optional[str] = None
+
+
+class TokenRequestRecord(BaseModel):
+    request_id: str
+    user_id: str
+    email: str
+    message: Optional[str] = None
+    status: str  # pending | resolved
+    created_at: Union[str, datetime]
+
+
+class TokenRequestResponse(BaseModel):
+    request: TokenRequestRecord
+
+
+class TokenRequestsResponse(BaseModel):
+    requests: List[TokenRequestRecord]
+    pending_count: int
+
+
 class QAResponse(BaseModel):
     answer: str
     sources: List[str]  # Now includes collection IDs

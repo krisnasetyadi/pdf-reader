@@ -9,13 +9,25 @@ Schema (two tables):
 Falls back to in-memory dict if DATABASE_URL is not set or DB is unreachable.
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone
 import logging
 import uuid
 import os
+
+# MS-237: how many *chats* GET /sessions/{id} returns per page. One chat is
+# one question plus the answer(s) that followed it — not one message row — so
+# a page never lands mid-exchange with a question whose answer is still on the
+# next page.
+PAGE_SIZE_DEFAULT = 5
+
+# MS-237: how many questions the navigation index below returns at most. It's
+# a flat list the client holds in memory for the hover panel, so it can't be
+# unbounded; past this the newest ones are the ones worth keeping (turn
+# numbers stay absolute, so the panel still labels them correctly).
+QUESTION_INDEX_LIMIT = 1000
 
 from router.auth import get_current_user, UserRecord
 
@@ -51,6 +63,15 @@ class SessionResponse(BaseModel):
     messages: List[StoredMessage]
     pdf_collections: List[str]
     chat_collections: List[str]
+    # MS-237: only meaningful on the paginated GET below. POST (create/
+    # update) always returns the full list it was given, so has_more is
+    # correctly False there too — nothing more to page in.
+    has_more: bool = False
+    next_cursor: Optional[str] = None
+    # Total user-authored messages in the session (loaded or not) — lets the
+    # client draw one navigation marker per question, including ones it
+    # hasn't fetched yet.
+    total_user_turns: int = 0
 
 class SessionSummary(BaseModel):
     session_id: str
@@ -60,6 +81,20 @@ class SessionSummary(BaseModel):
     updated_at: str
     pdf_collections: List[str]
     chat_collections: List[str]
+
+class SessionQuestion(BaseModel):
+    """One entry in the navigation index — a question the user asked, with
+    just enough text to recognise it in a list."""
+    turn: int          # 1-based, counted from the start of the session
+    message_id: str
+    preview: str
+
+
+class SessionQuestionsResponse(BaseModel):
+    session_id: str
+    total: int         # every question in the session, even beyond the cap below
+    questions: List[SessionQuestion]
+
 
 class RenameSessionRequest(BaseModel):
     title: str
@@ -152,6 +187,18 @@ def _get_required_conn():
         raise HTTPException(status_code=503, detail="Session database unavailable")
     _ensure_tables(conn)
     return conn
+
+
+def _parse_cursor(cursor: Optional[str]):
+    """"<created_at ISO>|<row id>" -> (created_at, id), or (None, None) if
+    absent/malformed — callers treat that as "start from the most recent"."""
+    if not cursor:
+        return None, None
+    try:
+        ts_str, id_str = cursor.rsplit("|", 1)
+        return ts_str, int(id_str)
+    except Exception:
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +297,7 @@ async def upsert_session(
             ],
             pdf_collections=list(session_row["pdf_collections"] or []),
             chat_collections=list(session_row["chat_collections"] or []),
+            total_user_turns=sum(1 for r in msg_rows if r["role"] == "user"),
         )
     except Exception as e:
         logger.error("sessions upsert DB error: %s", e)
@@ -262,14 +310,44 @@ async def upsert_session(
 
 
 @router.get("/sessions", response_model=List[SessionSummary])
-async def list_sessions(user: UserRecord = Depends(get_current_user)):
+async def list_sessions(
+    q: Optional[str] = None,
+    user: UserRecord = Depends(get_current_user),
+):
     """Return sessions owned by the current user (all sessions for admins),
-    ordered by most recent, with message counts."""
+    ordered by most recent, with message counts.
+
+    If `q` is given, also matches sessions whose title OR any message
+    content contains it (case-insensitive), not just the title.
+    """
     conn = _get_required_conn()
     try:
+        search_clause = ""
+        params: tuple = ()
+        if q:
+            # Escape backslashes first — ILIKE's default escape char is `\`,
+            # so an unescaped literal backslash in the query would otherwise
+            # consume the next character (including the wildcards we add).
+            escaped = (
+                q.replace(chr(92), chr(92) * 2)
+                .replace("%", chr(92) + "%")
+                .replace("_", chr(92) + "_")
+            )
+            pattern = f"%{escaped}%"
+            search_clause = """
+                AND (
+                    s.title ILIKE %s
+                    OR EXISTS (
+                        SELECT 1 FROM chat_messages cm
+                        WHERE cm.session_id = s.session_id AND cm.content ILIKE %s
+                    )
+                )
+            """
+            params = (pattern, pattern)
+
         with conn.cursor() as cur:
             if user.role == "admin":
-                cur.execute("""
+                cur.execute(f"""
                     SELECT s.session_id,
                            s.title,
                            s.pdf_collections,
@@ -279,13 +357,14 @@ async def list_sessions(user: UserRecord = Depends(get_current_user)):
                            COUNT(m.id) AS message_count
                     FROM chat_sessions s
                     LEFT JOIN chat_messages m ON m.session_id = s.session_id
+                    WHERE TRUE {search_clause}
                     GROUP BY s.session_id, s.title, s.pdf_collections,
                              s.chat_collections, s.created_at, s.updated_at
                     ORDER BY s.updated_at DESC
                     LIMIT 200
-                """)
+                """, params)
             else:
-                cur.execute("""
+                cur.execute(f"""
                     SELECT s.session_id,
                            s.title,
                            s.pdf_collections,
@@ -295,12 +374,12 @@ async def list_sessions(user: UserRecord = Depends(get_current_user)):
                            COUNT(m.id) AS message_count
                     FROM chat_sessions s
                     LEFT JOIN chat_messages m ON m.session_id = s.session_id
-                    WHERE s.owner_id = %s
+                    WHERE s.owner_id = %s {search_clause}
                     GROUP BY s.session_id, s.title, s.pdf_collections,
                              s.chat_collections, s.created_at, s.updated_at
                     ORDER BY s.updated_at DESC
                     LIMIT 200
-                """, (user.user_id,))
+                """, (user.user_id,) + params)
             rows = cur.fetchall()
         return [
             SessionSummary(
@@ -325,8 +404,19 @@ async def list_sessions(user: UserRecord = Depends(get_current_user)):
 
 
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str, user: UserRecord = Depends(get_current_user)):
-    """Return full session including all messages from chat_messages table."""
+async def get_session(
+    session_id: str,
+    limit: int = Query(PAGE_SIZE_DEFAULT, ge=1, le=100),
+    before: Optional[str] = None,
+    user: UserRecord = Depends(get_current_user),
+):
+    """Return a session's most recent `limit` chats — one chat being one
+    question plus the answer(s) that followed it, so `limit=5` is 5 complete
+    exchanges, not 5 message rows. MS-237: was "all messages, always"; a
+    long-lived conversation no longer dumps its entire history into one
+    response. Pass the previous response's `next_cursor` as `before` to page
+    further back; `has_more`/`next_cursor` come back falsy once the start of
+    the conversation is reached."""
     conn = _get_required_conn()
     try:
         with conn.cursor() as cur:
@@ -345,13 +435,71 @@ async def get_session(session_id: str, user: UserRecord = Depends(get_current_us
             ):
                 raise HTTPException(status_code=403, detail="Not allowed to access this session")
 
-            cur.execute("""
-                SELECT message_id, role, content, model_used, created_at
-                FROM chat_messages
-                WHERE session_id = %s
+            # Page by chat, not by message row: number every message with a
+            # running count of the questions asked up to and including it
+            # (`chat_no`), then keep only the last `limit` of those numbers.
+            # A question and the answer(s) that followed it share one
+            # chat_no, so they always travel together — a plain
+            # "LIMIT 5 rows" would cut between them and strand an answer
+            # without its question (or vice versa) on the page boundary.
+            before_ts, before_id = _parse_cursor(before)
+            chat_page_sql = """
+                WITH ordered AS (
+                    SELECT message_id, role, content, model_used, created_at, id,
+                           SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END)
+                               OVER (ORDER BY created_at ASC, id ASC) AS chat_no
+                    FROM chat_messages
+                    WHERE session_id = %s
+                    {cursor_clause}
+                )
+                SELECT message_id, role, content, model_used, created_at, id
+                FROM ordered
+                WHERE chat_no > (SELECT COALESCE(MAX(chat_no), 0) FROM ordered) - %s
                 ORDER BY created_at ASC, id ASC
-            """, (session_id,))
+            """
+            if before_ts is not None and before_id is not None:
+                cur.execute(
+                    chat_page_sql.format(cursor_clause="AND (created_at, id) < (%s, %s)"),
+                    (session_id, before_ts, before_id, limit),
+                )
+            else:
+                cur.execute(
+                    chat_page_sql.format(cursor_clause=""),
+                    (session_id, limit),
+                )
             msg_rows = cur.fetchall()
+
+            # Anything still older than the page we just built means there's
+            # another page behind it. Asked as its own EXISTS rather than
+            # over-fetching a row, since the page size is counted in chats
+            # and a "+1 row" trick can't tell a whole extra chat from the
+            # tail of the current one.
+            has_more = False
+            if msg_rows:
+                oldest = msg_rows[0]
+                cur.execute("""
+                    SELECT EXISTS(
+                        SELECT 1 FROM chat_messages
+                        WHERE session_id = %s AND (created_at, id) < (%s, %s)
+                    ) AS more
+                """, (session_id, oldest["created_at"], oldest["id"]))
+                has_more = bool(cur.fetchone()["more"])
+
+            # Needed so the client can draw a navigation marker for every
+            # question ever asked in this session, including ones it hasn't
+            # paged in yet (MS-237 poin 9: click an unloaded marker -> fetch
+            # the pages between here and there, then scroll to it).
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM chat_messages WHERE session_id = %s AND role = 'user'",
+                (session_id,),
+            )
+            total_user_turns = int(cur.fetchone()["n"] or 0)
+
+        next_cursor = None
+        if has_more and msg_rows:
+            oldest = msg_rows[0]
+            next_cursor = f"{_ts(oldest['created_at'])}|{oldest['id']}"
+
         return SessionResponse(
             session_id=session_row["session_id"],
             title=session_row["title"],
@@ -369,12 +517,94 @@ async def get_session(session_id: str, user: UserRecord = Depends(get_current_us
             ],
             pdf_collections=list(session_row["pdf_collections"] or []),
             chat_collections=list(session_row["chat_collections"] or []),
+            has_more=has_more,
+            next_cursor=next_cursor,
+            total_user_turns=total_user_turns,
         )
     except HTTPException:
         raise
     except Exception as e:
         logger.error("sessions get DB error: %s", e)
         raise HTTPException(status_code=500, detail="Failed to load session")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@router.get("/sessions/{session_id}/questions", response_model=SessionQuestionsResponse)
+async def get_session_questions(
+    session_id: str,
+    user: UserRecord = Depends(get_current_user),
+):
+    """Every question asked in this session, as a flat index: turn number,
+    the message id to scroll to, and a short preview.
+
+    MS-237: this backs the chat navigation panel, which lists the whole
+    conversation while the thread itself is still paginated 5 chats at a
+    time. Content is truncated in SQL so the response stays small no matter
+    how long the individual messages are — the panel only ever shows one
+    line per question."""
+    conn = _get_required_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT session_id, owner_id FROM chat_sessions WHERE session_id = %s",
+                (session_id,),
+            )
+            session_row = cur.fetchone()
+            if not session_row:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if (
+                user.role != "admin"
+                and session_row.get("owner_id")
+                and session_row["owner_id"] != user.user_id
+            ):
+                raise HTTPException(status_code=403, detail="Not allowed to access this session")
+
+            # Numbered over the whole session first, then cut to the newest
+            # QUESTION_INDEX_LIMIT — so a capped response still reports each
+            # question's real turn number rather than renumbering from 1.
+            cur.execute("""
+                WITH numbered AS (
+                    SELECT message_id,
+                           LEFT(content, 120) AS preview,
+                           ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS turn,
+                           created_at, id
+                    FROM chat_messages
+                    WHERE session_id = %s AND role = 'user'
+                )
+                SELECT message_id, preview, turn FROM (
+                    SELECT * FROM numbered ORDER BY created_at DESC, id DESC LIMIT %s
+                ) newest
+                ORDER BY turn ASC
+            """, (session_id, QUESTION_INDEX_LIMIT))
+            rows = cur.fetchall()
+
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM chat_messages WHERE session_id = %s AND role = 'user'",
+                (session_id,),
+            )
+            total = int(cur.fetchone()["n"] or 0)
+
+        return SessionQuestionsResponse(
+            session_id=session_id,
+            total=total,
+            questions=[
+                SessionQuestion(
+                    turn=int(r["turn"]),
+                    message_id=r["message_id"],
+                    preview=r["preview"] or "",
+                )
+                for r in rows
+            ],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("sessions questions DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to load session questions")
     finally:
         try:
             conn.close()

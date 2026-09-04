@@ -23,21 +23,52 @@ import storage as supabase_storage
 from router.auth import get_current_user, UserRecord
 from router.public_links import resolve_active_public_link_sources
 from router.database_connections import resolve_active_database_connections
+from router.payment import (
+    log_token_usage,
+    enforce_rate_limit,
+    enforce_member_allocation,
+    enforce_plan_limit,
+    resolve_workspace_id,
+    get_workspace_lock,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["agnostic"])
 
+# MS-237 poin 1: hard cap on the client-sent conversation-history window,
+# applied here regardless of what the client actually sends — a client that
+# sends 200 messages must not be able to balloon the prompt/token cost. The
+# window is counted in *chats* (one question plus the answer that followed
+# it), so 5 chats is up to ~10 messages; MAX_MEMORY_MESSAGES is the backstop
+# for a caller that pads one chat with a hundred assistant turns.
+MAX_MEMORY_CHATS = 5
+MAX_MEMORY_MESSAGES = MAX_MEMORY_CHATS * 4
+MAX_MEMORY_CHARS = 600
 
 
 # ---------------------------------------------------------------------------
 # Request schema
 # ---------------------------------------------------------------------------
 
+class MemoryTurn(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
 class AgnosticQueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
 
     # Kept for schema compatibility with HF Space / old clients — ignored locally.
     source: Optional[str] = Field(None)
+
+    # MS-237: which session this question belongs to (currently unused
+    # server-side — the client sends `memory` directly instead of us looking
+    # it up — kept so the contract already has it once that moves server-side).
+    session_id: Optional[str] = None
+    # Previous 5 messages so a follow-up like "ringkas semua di atas" has
+    # something to resolve against. Re-clamped below regardless of what the
+    # client sends.
+    memory: Optional[List[MemoryTurn]] = None
 
     include_pdf_results:  Optional[bool] = True
     # Legacy: queries THIS app's own fixed database (app management data, not
@@ -207,149 +238,219 @@ async def agnostic_query(
                 retrieved_count=0,
             )
 
-        # Chat is admin-only (business rule — non-admins never search it,
-        # regardless of what flags/ids the client sends).
-        chat_collection_ids = req.chat_collection_ids if is_admin else []
-        if is_admin and not chat_collection_ids and req.include_chat_results:
-            chat_collection_ids = processor.get_all_chat_collections()
-
-        should_search_pdfs = bool(req.include_pdf_results) and bool(pdf_collection_ids)
-        should_search_db   = bool(req.include_db_results)
-        should_search_chat = is_admin and bool(req.include_chat_results) and bool(chat_collection_ids)
-        public_link_sources: List[Dict[str, Any]] = []
-        if bool(req.include_public_links):
-            public_link_sources = await resolve_active_public_link_sources(
-                req.public_link_ids, user_id=user.user_id, is_admin=is_admin
+        # Past this point every branch actually calls the LLM (unlike the
+        # free system-answer branches above, which must stay reachable even
+        # for a capped user), so this is where rate limiting (MS-248) has to
+        # sit — checking any earlier would deny help text that costs nothing.
+        #
+        # Held for the rest of this request (through the LLM call and the
+        # token-usage log below), keyed by workspace (not just this user):
+        # enforce_plan_limit and enforce_member_allocation both check state
+        # shared across the whole team, so two different members racing
+        # concurrently must serialize against each other too, not just
+        # against their own other requests — see get_workspace_lock.
+        workspace_id = await asyncio.to_thread(resolve_workspace_id, user)
+        async with get_workspace_lock(workspace_id):
+            await asyncio.to_thread(enforce_rate_limit, user.user_id)
+            await asyncio.to_thread(enforce_plan_limit, user)
+            await asyncio.to_thread(enforce_member_allocation, user)
+            return await _run_metered_query(
+                req, user, is_admin, allowed_pdf_ids, pdf_collection_ids, base_url, start_time
             )
-        should_search_public_links = bool(req.include_public_links) and bool(public_link_sources)
-
-        # Database connections are admin-only (business rule), same as chat.
-        external_db_connections: List[Dict[str, Any]] = []
-        if is_admin and bool(req.include_external_db):
-            external_db_connections = await resolve_active_database_connections(req.external_db_connection_ids)
-        should_search_external_db = is_admin and bool(req.include_external_db) and bool(external_db_connections)
-
-        # Run hybrid search against pre-built FAISS indexes
-        hybrid_results = await asyncio.to_thread(
-            processor.hybrid_search,
-            req.question,
-            pdf_collection_ids or [],
-            should_search_chat,
-            should_search_pdfs,
-            should_search_db,
-            chat_collection_ids or [],
-            should_search_public_links,
-            public_link_sources,
-            should_search_external_db,
-            external_db_connections,
-        )
-
-        # Generate answer
-        answer_result = await asyncio.to_thread(
-            processor.generate_hybrid_answer,
-            hybrid_results,
-            req.question,
-            req.llm_provider,
-            req.llm_model,
-        )
-
-        if isinstance(answer_result, tuple) and len(answer_result) >= 2:
-            answer, model_used = answer_result[0], answer_result[1]
-        else:
-            answer     = str(answer_result)
-            model_used = req.llm_model or config.default_llm_model
-
-        # Map PDF docs -> response fields
-        pdf_sources: List[str] = []
-        pdf_sources_detailed: List[PdfSourceDetail] = []
-        for doc in hybrid_results.get("pdf_documents", []):
-            meta  = getattr(doc, "metadata", {})
-            fname = meta.get("source", "Unknown")
-            page  = meta.get("page")
-            pdf_sources.append(f"{fname} (Halaman {page})" if page else fname)
-
-            try:
-                page_num = int(page) if page is not None else None
-            except (ValueError, TypeError):
-                page_num = None
-
-            collection_id = meta.get("collection_id", "")
-            file_url = f"{base_url}/api/v1/files/{collection_id}/{fname}" if collection_id else None
-            page_url = f"{file_url}#page={page_num}" if file_url and page_num else file_url
-            content_text = doc.page_content.strip() if hasattr(doc, "page_content") else ""
-
-            pdf_sources_detailed.append(PdfSourceDetail(
-                file_name=fname,
-                collection_id=collection_id,
-                page=page_num,
-                relevance_score=meta.get("similarity_score", 0.0),
-                content_preview=(doc.page_content[:300]
-                                 if hasattr(doc, "page_content") else ""),
-                file_url=file_url,
-                page_url=page_url,
-                search_text=' '.join(content_text.split()[:15]),
-            ))
-
-        for doc in hybrid_results.get("public_link_documents", []):
-            meta = getattr(doc, "metadata", {})
-            fname = meta.get("source", "Unknown")
-            title = meta.get("public_link_title")
-            display_name = f"{title} / {fname}" if title else fname
-            pdf_sources.append(display_name)
-            item_url = meta.get("item_url")
-            content_text = doc.page_content.strip() if hasattr(doc, "page_content") else ""
-            pdf_sources_detailed.append(PdfSourceDetail(
-                file_name=display_name,
-                collection_id=meta.get("collection_id", "public-link"),
-                relevance_score=meta.get("similarity_score", 0.0),
-                content_preview=(doc.page_content[:300] if hasattr(doc, "page_content") else ""),
-                file_url=item_url,
-                page_url=item_url,
-                search_text=' '.join(content_text.split()[:15]),
-            ))
-
-        for doc in hybrid_results.get("external_db_documents", []):
-            meta = getattr(doc, "metadata", {})
-            table_name = meta.get("source", "Unknown")
-            label = meta.get("external_db_label", "Database")
-            display_name = f"{label} / {table_name}"
-            pdf_sources.append(display_name)
-            pdf_sources_detailed.append(PdfSourceDetail(
-                file_name=display_name,
-                collection_id=meta.get("collection_id", "external-db"),
-                relevance_score=meta.get("similarity_score", 0.0),
-                content_preview=(doc.page_content[:300] if hasattr(doc, "page_content") else ""),
-            ))
-
-        chat_results = []
-        for doc in hybrid_results.get("chat_documents", []):
-            meta = getattr(doc, "metadata", {})
-            chat_results.append({
-                "source":          meta.get("source", "Unknown"),
-                "platform":        meta.get("platform", "chat"),
-                "relevance_score": meta.get("similarity_score", 0),
-                "content_preview": (doc.page_content[:200]
-                                    if hasattr(doc, "page_content") else ""),
-            })
-
-        elapsed = (datetime.now() - start_time).total_seconds()
-
-        return AgnosticQueryResponse(
-            answer=answer,
-            model_used=model_used,
-            pdf_sources=pdf_sources,
-            pdf_sources_detailed=pdf_sources_detailed,
-            db_results=hybrid_results.get("database_results", {}),
-            chat_results=chat_results,
-            processing_time=elapsed,
-            search_terms=hybrid_results.get("search_terms", [req.question]),
-            target_tables=hybrid_results.get("target_tables", []),
-            source_type=_describe_source_type(should_search_public_links, should_search_external_db),
-            retrieved_count=len(pdf_sources) + len(chat_results),
-        )
 
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("agnostic_query failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _run_metered_query(
+    req: AgnosticQueryRequest,
+    user: UserRecord,
+    is_admin: bool,
+    allowed_pdf_ids: set,
+    pdf_collection_ids: List[str],
+    base_url: str,
+    start_time: datetime,
+) -> "AgnosticQueryResponse":
+    """The token-costing half of agnostic_query — everything from source
+    resolution through the LLM call and usage logging, run while the
+    caller holds that user's rate-limit lock. Split out from
+    agnostic_query so that lock's scope is a plain, visible function call
+    rather than a large indented block sharing the outer try/except."""
+    # Chat is admin-only (business rule — non-admins never search it,
+    # regardless of what flags/ids the client sends).
+    chat_collection_ids = req.chat_collection_ids if is_admin else []
+    if is_admin and not chat_collection_ids and req.include_chat_results:
+        chat_collection_ids = processor.get_all_chat_collections()
+
+    should_search_pdfs = bool(req.include_pdf_results) and bool(pdf_collection_ids)
+    should_search_db   = bool(req.include_db_results)
+    should_search_chat = is_admin and bool(req.include_chat_results) and bool(chat_collection_ids)
+    public_link_sources: List[Dict[str, Any]] = []
+    if bool(req.include_public_links):
+        public_link_sources = await resolve_active_public_link_sources(
+            req.public_link_ids, user_id=user.user_id, is_admin=is_admin
+        )
+    should_search_public_links = bool(req.include_public_links) and bool(public_link_sources)
+
+    # Database connections are admin-only (business rule), same as chat.
+    external_db_connections: List[Dict[str, Any]] = []
+    if is_admin and bool(req.include_external_db):
+        external_db_connections = await resolve_active_database_connections(req.external_db_connection_ids)
+    should_search_external_db = is_admin and bool(req.include_external_db) and bool(external_db_connections)
+
+    # Run hybrid search against pre-built FAISS indexes
+    hybrid_results = await asyncio.to_thread(
+        processor.hybrid_search,
+        req.question,
+        pdf_collection_ids or [],
+        should_search_chat,
+        should_search_pdfs,
+        should_search_db,
+        chat_collection_ids or [],
+        should_search_public_links,
+        public_link_sources,
+        should_search_external_db,
+        external_db_connections,
+    )
+
+    # MS-237: clamp the client's conversation-history window before it
+    # ever reaches the prompt — see MAX_MEMORY_* above. Cut at the start
+    # of the 5th-from-last question rather than at a raw message count,
+    # so every remembered question keeps the answer that belongs to it.
+    memory_payload: Optional[List[Dict[str, str]]] = None
+    if req.memory:
+        question_at = [i for i, m in enumerate(req.memory) if m.role == "user"]
+        start = (
+            question_at[-MAX_MEMORY_CHATS]
+            if len(question_at) > MAX_MEMORY_CHATS
+            else 0
+        )
+        memory_payload = [
+            {"role": m.role, "content": m.content[:MAX_MEMORY_CHARS]}
+            for m in req.memory[start:][-MAX_MEMORY_MESSAGES:]
+        ]
+
+    # Generate answer
+    answer_result = await asyncio.to_thread(
+        processor.generate_hybrid_answer,
+        hybrid_results,
+        req.question,
+        req.llm_provider,
+        req.llm_model,
+        memory_payload,
+    )
+
+    if isinstance(answer_result, tuple) and len(answer_result) >= 2:
+        answer, model_used = answer_result[0], answer_result[1]
+        answer_metadata = (
+            answer_result[2] if len(answer_result) >= 3 and isinstance(answer_result[2], dict) else {}
+        )
+    else:
+        answer     = str(answer_result)
+        model_used = req.llm_model or config.default_llm_model
+        answer_metadata = {}
+
+    # Best-effort token metering (MS-248) — never let a logging hiccup
+    # break a chat response that already succeeded. Run in a thread: this
+    # does blocking DB I/O and we're holding the caller's rate-limit lock,
+    # so a blocking call here would stall every other coroutine waiting on
+    # that same lock (including this same user's next request), not just
+    # this one.
+    try:
+        tokens_consumed = answer_metadata.get("total_tokens", 0)
+        if tokens_consumed:
+            await asyncio.to_thread(log_token_usage, user.user_id, tokens_consumed)
+    except Exception:
+        logger.warning("agnostic_query: failed to log token usage", exc_info=True)
+
+    # Map PDF docs -> response fields
+    pdf_sources: List[str] = []
+    pdf_sources_detailed: List[PdfSourceDetail] = []
+    for doc in hybrid_results.get("pdf_documents", []):
+        meta  = getattr(doc, "metadata", {})
+        fname = meta.get("source", "Unknown")
+        page  = meta.get("page")
+        pdf_sources.append(f"{fname} (Halaman {page})" if page else fname)
+
+        try:
+            page_num = int(page) if page is not None else None
+        except (ValueError, TypeError):
+            page_num = None
+
+        collection_id = meta.get("collection_id", "")
+        file_url = f"{base_url}/api/v1/files/{collection_id}/{fname}" if collection_id else None
+        page_url = f"{file_url}#page={page_num}" if file_url and page_num else file_url
+        content_text = doc.page_content.strip() if hasattr(doc, "page_content") else ""
+
+        pdf_sources_detailed.append(PdfSourceDetail(
+            file_name=fname,
+            collection_id=collection_id,
+            page=page_num,
+            relevance_score=meta.get("similarity_score", 0.0),
+            content_preview=(doc.page_content[:300]
+                             if hasattr(doc, "page_content") else ""),
+            file_url=file_url,
+            page_url=page_url,
+            search_text=' '.join(content_text.split()[:15]),
+        ))
+
+    for doc in hybrid_results.get("public_link_documents", []):
+        meta = getattr(doc, "metadata", {})
+        fname = meta.get("source", "Unknown")
+        title = meta.get("public_link_title")
+        display_name = f"{title} / {fname}" if title else fname
+        pdf_sources.append(display_name)
+        item_url = meta.get("item_url")
+        content_text = doc.page_content.strip() if hasattr(doc, "page_content") else ""
+        pdf_sources_detailed.append(PdfSourceDetail(
+            file_name=display_name,
+            collection_id=meta.get("collection_id", "public-link"),
+            relevance_score=meta.get("similarity_score", 0.0),
+            content_preview=(doc.page_content[:300] if hasattr(doc, "page_content") else ""),
+            file_url=item_url,
+            page_url=item_url,
+            search_text=' '.join(content_text.split()[:15]),
+        ))
+
+    for doc in hybrid_results.get("external_db_documents", []):
+        meta = getattr(doc, "metadata", {})
+        table_name = meta.get("source", "Unknown")
+        label = meta.get("external_db_label", "Database")
+        display_name = f"{label} / {table_name}"
+        pdf_sources.append(display_name)
+        pdf_sources_detailed.append(PdfSourceDetail(
+            file_name=display_name,
+            collection_id=meta.get("collection_id", "external-db"),
+            relevance_score=meta.get("similarity_score", 0.0),
+            content_preview=(doc.page_content[:300] if hasattr(doc, "page_content") else ""),
+        ))
+
+    chat_results = []
+    for doc in hybrid_results.get("chat_documents", []):
+        meta = getattr(doc, "metadata", {})
+        chat_results.append({
+            "source":          meta.get("source", "Unknown"),
+            "platform":        meta.get("platform", "chat"),
+            "relevance_score": meta.get("similarity_score", 0),
+            "content_preview": (doc.page_content[:200]
+                                if hasattr(doc, "page_content") else ""),
+        })
+
+    elapsed = (datetime.now() - start_time).total_seconds()
+
+    return AgnosticQueryResponse(
+        answer=answer,
+        model_used=model_used,
+        pdf_sources=pdf_sources,
+        pdf_sources_detailed=pdf_sources_detailed,
+        db_results=hybrid_results.get("database_results", {}),
+        chat_results=chat_results,
+        processing_time=elapsed,
+        search_terms=hybrid_results.get("search_terms", [req.question]),
+        target_tables=hybrid_results.get("target_tables", []),
+        source_type=_describe_source_type(should_search_public_links, should_search_external_db),
+        retrieved_count=len(pdf_sources) + len(chat_results),
+    )

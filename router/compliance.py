@@ -20,6 +20,14 @@ from models import GapAnalysisRequest, GapAnalysisResponse, GapAnalysisRun, GapA
 from processor import processor
 import storage as supabase_storage
 from router.auth import get_current_user, UserRecord
+from router.payment import (
+    log_token_usage,
+    enforce_rate_limit,
+    enforce_member_allocation,
+    enforce_plan_limit,
+    resolve_workspace_id,
+    get_workspace_lock,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -87,15 +95,33 @@ async def run_gap_analysis(
                 status_code=400,
                 detail="target_collection_ids is required for compliance_gap_check",
             )
-        # run_compliance_gap_check makes several sequential blocking LLM
-        # calls — off the event loop, or one gap-analysis run freezes every
-        # other concurrent request (health checks included) until it finishes.
-        items, disclaimer = await asyncio.to_thread(
-            processor.run_compliance_gap_check,
-            reference_collection_ids=body.reference_collection_ids,
-            target_collection_ids=body.target_collection_ids,
-            framework_name=body.framework_name,
-        )
+        # Gap Check is a second, separate path to the LLM alongside
+        # /agnostic/query (MS-248) — it must be metered/enforced the same
+        # way, or the flat rate limit and per-member allocation are just
+        # opt-in via which feature you happen to use. Same workspace-keyed
+        # lock as agnostic.py — see get_workspace_lock's docstring for why
+        # it's keyed by workspace rather than by this caller alone.
+        workspace_id = await asyncio.to_thread(resolve_workspace_id, user)
+        async with get_workspace_lock(workspace_id):
+            await asyncio.to_thread(enforce_rate_limit, user.user_id)
+            await asyncio.to_thread(enforce_plan_limit, user)
+            await asyncio.to_thread(enforce_member_allocation, user)
+
+            # run_compliance_gap_check makes several sequential blocking LLM
+            # calls — off the event loop, or one gap-analysis run freezes every
+            # other concurrent request (health checks included) until it finishes.
+            items, disclaimer, tokens_consumed = await asyncio.to_thread(
+                processor.run_compliance_gap_check,
+                reference_collection_ids=body.reference_collection_ids,
+                target_collection_ids=body.target_collection_ids,
+                framework_name=body.framework_name,
+            )
+
+            if tokens_consumed:
+                try:
+                    await asyncio.to_thread(log_token_usage, user.user_id, tokens_consumed)
+                except Exception:
+                    logger.warning("run_gap_analysis: failed to log token usage", exc_info=True)
     else:
         # scenario_regulatory_impact — scaffold only. The endpoint works
         # end-to-end (request validated, run persisted) so the structure
