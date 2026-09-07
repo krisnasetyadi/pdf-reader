@@ -70,6 +70,13 @@ class AgnosticQueryRequest(BaseModel):
     # client sends.
     memory: Optional[List[MemoryTurn]] = None
 
+    # MS-252: one-shot skill invocation — the uploaded Skill (see
+    # router/skills.py) whose `instruction` should shape THIS answer only.
+    # Resolved + authorization-checked server-side via
+    # storage.get_skill_for_user; an unresolved id is ignored, never an
+    # error (the client already cleared its own armed state either way).
+    skill_id: Optional[str] = None
+
     include_pdf_results:  Optional[bool] = True
     # Legacy: queries THIS app's own fixed database (app management data, not
     # a user-connected source). Kept for backward compatibility only.
@@ -333,6 +340,24 @@ async def _run_metered_query(
             for m in req.memory[start:][-MAX_MEMORY_MESSAGES:]
         ]
 
+    # MS-252: resolve the one-shot skill (if any) to its instruction text.
+    # get_skill_for_user already enforces personal/team visibility — an id
+    # that doesn't exist or isn't visible to this user just yields None, so
+    # a deleted/foreign skill_id silently falls back to normal chat instead
+    # of erroring the whole request.
+    skill_instruction: Optional[str] = None
+    if req.skill_id:
+        skill_row = await asyncio.to_thread(
+            supabase_storage.get_skill_for_user, req.skill_id, user.user_id, is_admin
+        )
+        if skill_row:
+            skill_instruction = skill_row["instruction"]
+        else:
+            logger.warning(
+                "agnostic_query: skill_id=%s not visible to user=%s — ignoring",
+                req.skill_id, user.user_id,
+            )
+
     # Generate answer
     answer_result = await asyncio.to_thread(
         processor.generate_hybrid_answer,
@@ -341,6 +366,7 @@ async def _run_metered_query(
         req.llm_provider,
         req.llm_model,
         memory_payload,
+        skill_instruction,
     )
 
     if isinstance(answer_result, tuple) and len(answer_result) >= 2:

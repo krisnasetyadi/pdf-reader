@@ -2662,6 +2662,7 @@ Answer:"""
         llm_provider: Optional[str] = None,
         llm_model: Optional[str] = None,
         memory: Optional[List[Dict[str, str]]] = None,
+        skill_instruction: Optional[str] = None,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Enhanced hybrid answer generation dengan conflict resolution and comprehensive metadata"""
         
@@ -2828,6 +2829,17 @@ Answer:"""
                 + "\n".join(history_lines)
             )
             prompt = f"{history_block}\n\n{prompt}"
+
+        # MS-252: one-shot skill invocation — prepended last (outermost) so
+        # it reads before the conversation history and the task/document
+        # prompt it wraps. Same orthogonal-prepend shape as `memory` above:
+        # never folded into `context` or any `_build_*_prompt` builder, so
+        # it applies regardless of detected intent. Caller (router/
+        # agnostic.py) has already resolved + authorization-checked the
+        # skill — this only formats it.
+        if skill_instruction:
+            skill_block = f"INSTRUKSI KHUSUS (skill aktif untuk pesan ini):\n{skill_instruction.strip()}"
+            prompt = f"{skill_block}\n\n{prompt}"
 
         try:
             result = llm.invoke(prompt)
