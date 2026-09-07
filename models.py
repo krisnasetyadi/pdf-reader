@@ -1,5 +1,5 @@
 # models.py
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Optional, Dict, Any, Union
 from enum import Enum
 from datetime import datetime
@@ -573,3 +573,102 @@ class GapAnalysisResponse(BaseModel):
     items: List[GapAnalysisItem]
     summary: Dict[str, int]  # counts per status, e.g. {"met": 60, "partial": 18, "not_met": 15, "unknown": 0}
     disclaimer: Optional[str] = None
+
+
+# ===================== SKILLS (MS-251) =====================
+# A skill is an uploaded instruction file: `instruction` holds the body of the
+# .md, the rest is its frontmatter. Who may use it is decided by `scope` alone
+# — "personal" is the uploader's own, "team" is an admin's and reaches every
+# member that admin created (see storage.list_skills_for_user).
+
+SKILL_SCOPES = ("personal", "team")
+
+
+def _validate_scope(v: str) -> str:
+    if v not in SKILL_SCOPES:
+        raise ValueError(f"scope must be one of {SKILL_SCOPES}")
+    return v
+
+
+def _normalize_command(v: str) -> str:
+    """Store commands in the one shape the "/" menu matches on, so a skill
+    uploaded as "audit" is still reachable as "/audit"."""
+    v = v.strip()
+    if not v.lstrip("/"):
+        raise ValueError("slash_command must not be empty")
+    return "/" + v.lstrip("/")
+
+
+def _require_text(v: str, field: str) -> str:
+    if not v or not v.strip():
+        raise ValueError(f"{field} must not be empty")
+    return v.strip()
+
+
+class SkillCreate(BaseModel):
+    name: str
+    slash_command: str
+    instruction: str          # body of the uploaded .md
+    description: str = ""
+    scope: str = "personal"   # "team" is rejected for non-admins in router/skills.py
+
+    @field_validator("scope")
+    @classmethod
+    def _scope(cls, v: str) -> str:
+        return _validate_scope(v)
+
+    @field_validator("slash_command")
+    @classmethod
+    def _command(cls, v: str) -> str:
+        return _normalize_command(v)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        return _require_text(v, "name")
+
+    @field_validator("instruction")
+    @classmethod
+    def _instruction(cls, v: str) -> str:
+        return _require_text(v, "instruction")
+
+
+class SkillUpdate(BaseModel):
+    """Partial update — every field optional, omitted ones are left alone."""
+    name: Optional[str] = None
+    slash_command: Optional[str] = None
+    instruction: Optional[str] = None
+    description: Optional[str] = None
+    scope: Optional[str] = None
+
+    @field_validator("scope")
+    @classmethod
+    def _scope(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_scope(v) if v is not None else v
+
+    @field_validator("slash_command")
+    @classmethod
+    def _command(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_command(v) if v is not None else v
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: Optional[str]) -> Optional[str]:
+        return _require_text(v, "name") if v is not None else v
+
+    @field_validator("instruction")
+    @classmethod
+    def _instruction(cls, v: Optional[str]) -> Optional[str]:
+        return _require_text(v, "instruction") if v is not None else v
+
+
+class SkillResponse(BaseModel):
+    skill_id: str
+    name: str
+    slash_command: str
+    description: str = ""
+    instruction: str
+    scope: str
+    owner_id: str
+    created_at: Union[str, datetime] = ""
+    updated_at: Union[str, datetime] = ""
