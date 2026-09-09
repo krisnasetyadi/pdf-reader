@@ -164,6 +164,18 @@ DOCUMENT_EXTRACTORS = {
     ".txt": extract_text_from_txt,
 }
 
+# Mirrors DOCUMENT_EXTRACTORS' key set — keyed by lowercase file extension,
+# used wherever an uploaded document's real MIME type needs to be recorded
+# (e.g. S3 object metadata) instead of assuming PDF.
+CONTENT_TYPE_BY_EXT = {
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
 
 def process_pdfs(pdf_paths, collection_id):
     """Process uploaded documents (PDF, DOCX, CSV, XLSX, TXT — despite the

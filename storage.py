@@ -24,7 +24,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 from config import config
-from utils import DOCUMENT_EXTRACTORS
+from utils import DOCUMENT_EXTRACTORS, CONTENT_TYPE_BY_EXT
 
 logger = logging.getLogger(__name__)
 
@@ -378,18 +378,21 @@ def _db_conn():
 # ---------------------------------------------------------------------------
 
 def upload_pdf(collection_id: str, file_path: str, filename: str) -> Optional[str]:
-    """Upload a raw PDF to the pdf-uploads bucket. Returns S3 key or None."""
+    """Upload a raw document (PDF, DOCX, CSV, XLSX, TXT — name kept for
+    backward compatibility) to the pdf-uploads bucket. Returns S3 key or None."""
     s3 = _s3_client()
     if not s3:
         return None
     key = f"{collection_id}/{filename}"
+    ext = os.path.splitext(filename)[1].lower()
+    content_type = CONTENT_TYPE_BY_EXT.get(ext, "application/octet-stream")
     try:
         s3.upload_file(file_path, _UPLOADS_BUCKET, key,
-                       ExtraArgs={"ContentType": "application/pdf"})
-        logger.info("Uploaded PDF: %s", key)
+                       ExtraArgs={"ContentType": content_type})
+        logger.info("Uploaded file: %s (%s)", key, content_type)
         return key
     except Exception as e:
-        logger.warning("PDF upload failed (%s): %s", key, e)
+        logger.warning("File upload failed (%s): %s", key, e)
         return None
 
 
